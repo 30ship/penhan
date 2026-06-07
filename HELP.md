@@ -1,62 +1,66 @@
-# Project Nahan (نهان) - User Walkthrough
+# Nahan Project - User Guide
 
-This guide will walk you through accessing and managing your deployed Nahan gateway.
+This guide walks you through the steps to access, configure, and manage your "Nahan" network gateway.
 
-## 1. Accessing the Dashboard
+## 1. Accessing the Management Dashboard
 
-By default, your dashboard is mapped to the `/sync/dash` route. 
-To access it, open your browser and navigate to:
+Your management dashboard is located at `/sync/dash` by default.
+To open it, open your browser and navigate to the following address:
 `https://<YOUR_WORKER_DOMAIN>/sync/dash`
 
-*(Note: If you visit the root domain or `/sync` via a web browser, the system will camouflage itself and show the specified maintenance websites to redirect network scanners).*
+*(Note: If you open the main domain address or the `/sync` path without the WebSocket identifier in the browser, the system will automatically camouflage and load disguise sites like Ubuntu or Docker to mislead network scanners).*
 
 ## 2. Authentication
 
-When you open the dashboard, you will be greeted by the gateway login screen.
+Upon accessing the dashboard, you will be greeted with a login page.
 *   **Default Master Key:** `admin`
-*   Enter your key and click **Authenticate**.
+*   Enter the word `admin` and click the **Authenticate** button.
 
-*(If you see a warning saying "⚠️ IOT_DB namespace missing!", it means you have not bound the `IOT_DB` KV namespace to your worker. Return to Cloudflare settings to bind it before attempting to save configuration updates).*
+*(If you see a red warning message "⚠️ IOT_DB space not found!", it means you have not connected the D1 database to your worker in the Cloudflare panel. Make sure to establish this connection in Cloudflare before saving any changes).*
 
-## 3. Using the Dashboard
+## 3. Dashboard Sections
 
-The dashboard consists of 5 main sections:
+The dashboard consists of the following main sections:
 
-### 📡 Endpoints (Info)
-This is where you retrieve your connection strings to import into your client application.
-*   **Profile Cards:** Your profiles (Default + Multi-User) are displayed as individual cards.
-*   **Show QR Code:** Click the **Show QR Code** button on any card to open a modal with a scannable QR code for easy mobile setup.
-*   **Cloud Sync URL:** The base API path for direct Sub/Config syncing. Use the copy button to grab the link.
+### 📡 Endpoints (Connections)
+In this section, you can retrieve your connection links to import into client applications.
+*   **Profile Cards:** Your profiles (default and added users) are displayed as separate cards.
+*   **Show QR Code:** Clicking the **Show QR Code** button on any card opens a window with a QR code that you can scan with your phone.
+*   **Cloud Sync URL (Sub Link):** A unified subscription link to fetch all configurations simultaneously. A copy button is available for quick copying.
 
-### 📊 Metrics (Network)
-Displays network properties regarding the processing Cloudflare edge node.
-*   **Live Profile Usage:** Shows active connection counts and last activity time for your profiles (Note: resets if the worker restarts).
-*   **Network Cards:** View Origin IP, executing Edge Node (Colo), and Regional data.
-*   **Latency Diagnostics:** Click "Run Diagnostics" to measure real-time latency from your browser to your configured Clean IPs.
+### 👥 Users Management
+A user management system with precise tracking of bandwidth and expiration dates:
+*   **Add User:** Set traffic limits (in GB) and validity days for each new user.
+*   **Pause User:** You can temporarily suspend a specific user's access by clicking the ⏸️ button.
+*   **Subscription Links and QR:** Ability to get a dedicated subscription link for each user.
 
-### ⚙️ System (Settings)
-Configure core gateway profiles:
-*   **Primary Display Mode:** Toggle between `Alpha Mode` (VLESS) and `Beta Mode` (Trojan).
-*   **Device UUID:** Your connection identifier/password. Leaving this blank causes the system to auto-generate one based on your path.
-*   **API Route:** Change this from `sync` to a hidden keyword (e.g., `my-secret-path`). Your dashboard will dynamically move to `/my-secret-path/dash`.
-*   **Master Key:** Change the dashboard login password from `admin` to a secure custom passphrase.
-*   **Backup & Restore:** Export your current dashboard parameters to a local `.json` file, or import a previously saved backup file to populate all inputs instantly.
+### 📊 Metrics (Network Status)
+Displays information about the Cloudflare Edge node your traffic is passing through.
+*   **Server Details:** Shows the origin IP, the processing Edge node (Colo), and geographic location.
+*   **Network Latency Diagnostics:** By clicking "Run Diagnostics", you can measure your browser's real-time latency (ping) to the entered clean IPs.
 
-### 🌐 Advanced (Network)
-Fine-tune transport properties and integrations:
-*   **Clean IPs (Multi-Generator):** Input your preferred clean Cloudflare IPs (comma or line separated). The subscription generator automatically multiplies configs for all IPs.
-*   **Multi-Sensor Profiles:** Create separate profiles for different users. Format: `uuid:Name`. Users can access their specific config by appending `?sub=Name` to the Sync URL.
-*   **Telegram Bot:** Enter your Bot Token and Chat ID to receive login alerts and manage the gateway remotely via Telegram commands (e.g., `/status`, `/pause`).
-*   **Cloudflare Analytics:** Optional. Enter your Account ID and API Token to monitor daily Worker request usage (limit 100k/day).
-*   **Kill Switch:** An emergency toggle to immediately pause all proxy traffic without deleting the worker.
-*   **Secure Hello (ECH):** Toggle Encrypted Client Hello parameters in client configurations.
+### ⚙️ System (Basic Settings)
+Configure the server's identity and core behaviors:
+*   **Display Protocol:** Switch between Alpha (VLESS), Beta (Trojan), or **Both** (both concurrently in the sub link) modes.
+*   **Unique Identifier (UUID):** Your connection password or identifier. If left blank, the system generates an automatic ID.
+*   **Secret API Route:** Change the dashboard login path and subscription address. This changes your login address to `/<secret-path>/dash`.
+*   **Master Key:** Change the dashboard login password from `admin` to a secure phrase.
+*   **Backup & Restore:** Save current settings to a local `.json` file or load a previous backup file.
 
-### 📋 Activity Logs
-*   View a history of recent login attempts and configuration changes.
+### 🌐 Advanced
+Optimize network connection details and integrations:
+*   **Clean IPs:** Enter a list of Cloudflare clean IPs (one IP per line). The subscription link automatically combines and multiplies configurations with these values.
+*   **Slave Nodes:** If you have created other workers on different domains besides this panel, enter their links here separated by commas (`,`) (e.g., `node1.domain.com, node2.domain.com`). 
+The main panel automatically synchronizes all changes and users with them and includes their configurations in the subscription link!
+*   **Telegram Bot:** Enter your bot token and ID to receive dashboard login alerts and manage remotely with `/status`, `/users`, and `/pause` commands.
+*   **Emergency Kill Switch:** A button to immediately cut off all proxy traffic.
 
-## 4. Applying Changes
+### 📋 Logs (Activity Report)
+*   View the history of recent login attempts and configuration changes.
 
-After adjusting any inputs in the **System** or **Advanced** tabs:
-1. Click the **Update Config** button at the bottom of the screen.
-2. The indicator will show "Syncing..." and then reload automatically.
-3. *Important:* If you changed the **API Route**, the page will automatically redirect you to the new URL (e.g., `/<new-route>/dash`). Please bookmark the new link for future access.
+## 4. Saving Configurations
+
+After making changes in the **System** or **Advanced** sections:
+1. Click the blue **Update Config** button at the bottom of the page.
+2. The status will change to "Saving...", and the page will automatically refresh.
+3. *Important:* If you modified the **Secret API Route**, the page will automatically redirect to the new address. Make sure to bookmark the new address in your browser.
