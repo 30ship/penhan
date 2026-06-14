@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.5.2";
+const CURRENT_VERSION = "2.5.3";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -177,7 +177,7 @@ function trackUsage(uuid, bytes, env, ctx) {
                                 ctx?.waitUntil(fetch(`https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`, {
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ chat_id: notifyChatId, text: tgMsg, parse_mode: 'Markdown' })
+                                    body: JSON.stringify({ chat_id: notifyChatId, text: tgMsg, parse_mode: 'HTML' })
                                 }).catch(()=>{}));
                             }
                         }
@@ -721,8 +721,10 @@ async function fetchCloudflareUsage(accountId, apiToken) {
     }
 }
 
-async function sendTelegramMessage(request, type) {
+async function sendTelegramMessage(request, type, hostName) {
     if (!sysConfig.tgToken || !(sysConfig.tgAdminId || sysConfig.tgChatId)) return;
+
+    const escMd = (s) => String(s).replace(/[_*`[]/g, '\\$&');
 
     let usageStr = "نامشخص (0.00%)";
     if (sysConfig.cfAccountId && sysConfig.cfApiToken) {
@@ -750,17 +752,39 @@ async function sendTelegramMessage(request, type) {
         hour: '2-digit', minute: '2-digit', second: '2-digit' 
     }).format(d);
 
-    const text = `📌 نوع: ${type}\n` +
-                 `🌐 IP: ${ip}\n` +
-                 `📍 موقعیت: ${country} ${city}\n` +
-                 `🏢 ASN: AS${asn} ${asOrg}\n` +
-                 `🔗 دامنه: ${domain}\n` +
-                 `🔍 مسیر: ${path}\n` +
-                 `🤖 مرورگر: ${ua}\n` +
-                 `📅 زمان: ${timeStr}\n` +
+    const text = `📌 نوع: ${escMd(type)}\n` +
+                 `🌐 IP: ${escMd(ip)}\n` +
+                 `📍 موقعیت: ${escMd(country)} ${escMd(city)}\n` +
+                 `🏢 ASN: AS${escMd(asn)} ${escMd(asOrg)}\n` +
+                 `🔗 دامنه: ${escMd(domain)}\n` +
+                 `🔍 مسیر: ${escMd(path)}\n` +
+                 `🤖 مرورگر: ${escMd(ua)}\n` +
+                 `📅 زمان: ${escMd(timeStr)}\n` +
                  `📊 مصرف: ${usageStr}`;
 
-    const panelUrl = `https://${domain}/${encodeURI(sysConfig.apiRoute)}/dash`;
+    const h = hostName || domain;
+    const langCode = sysConfig.tgBotLang || "fa";
+    const locT = (key) => botI18n[langCode]?.[key] || botI18n["en"]?.[key] || key;
+    const isPaused = sysConfig.isPaused || false;
+    const panelUrl = `https://${h}/${encodeURI(sysConfig.apiRoute)}/dash`;
+    const subUrl = `https://${h}/${sysConfig.apiRoute}`;
+    const inline_keyboard = [
+        [
+            { text: `📊 ${locT("dashboard")}`, callback_data: "sys_dashboard" },
+            { text: `📈 ${locT("statistics")}`, callback_data: "sys_stats" }
+        ],
+        [
+            { text: `🔗 ${locT("btn_sub_link")}`, callback_data: "get_sub_link" },
+            { text: `ℹ️ ${locT("panel_info")}`, callback_data: "sys_panel_info" }
+        ],
+        [
+            { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
+            { text: isPaused ? locT("btn_resume") : locT("btn_pause"), callback_data: "sys_toggle_status" }
+        ],
+        [
+            { text: `🔑 ${locT("dash")}`, web_app: { url: panelUrl } }
+        ]
+    ];
 
     const tgUrl = `https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`;
     const notifyChatId = sysConfig.tgAdminId || sysConfig.tgChatId;
@@ -772,15 +796,7 @@ async function sendTelegramMessage(request, type) {
                 chat_id: notifyChatId,
                 text: text,
                 parse_mode: 'Markdown',
-                reply_markup: /** @type {any} */ ({
-                    inline_keyboard: [
-                        [{ text: "ورود به پنل 🔐", web_app: { url: panelUrl } }],
-                        [
-                            { text: "دریافت ساب 🔗", callback_data: "get_sub" },
-                            { text: "بروزرسانی مصرف 📊", callback_data: "get_usage" }
-                        ]
-                    ]
-                })
+                reply_markup: /** @type {any} */ ({ inline_keyboard })
             })
         });
     } catch (e) {}
@@ -1010,7 +1026,7 @@ async function handleAuth(request, hostName, ctx, env) {
         const ip = request.headers.get("cf-connecting-ip") || "Unknown";
         if (data.key === sysConfig.masterKey) {
             ctx?.waitUntil(logActivity(env, "Auth Success", `Successful panel login from ${ip}`));
-            if (!sysConfig.silentAlerts && ctx) ctx.waitUntil(sendTelegramMessage(request, "ورود به پنل (موفق)"));
+            if (!sysConfig.silentAlerts && ctx) ctx.waitUntil(sendTelegramMessage(request, "ورود به پنل (موفق)", hostName));
 
             // Store login signal for Telegram bot
             if (sysConfig.tgAdminId && env.IOT_DB) {
@@ -1081,7 +1097,7 @@ async function handleAuth(request, hostName, ctx, env) {
             }), { status: 200 });
         }
         ctx?.waitUntil(logActivity(env, "Auth Failed", `Failed login attempt from ${ip}`));
-        if (ctx) ctx.waitUntil(sendTelegramMessage(request, "تلاش ناموفق ورود به پنل!"));
+        if (ctx) ctx.waitUntil(sendTelegramMessage(request, "تلاش ناموفق ورود به پنل!", hostName));
         return new Response(JSON.stringify({ success: false }), { status: 401 });
     } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
 }
@@ -1258,6 +1274,9 @@ const botI18n = {
         msg_panel_selected: "Panel selected! ✅",
         msg_panel_error: "❌ Failed to connect to the selected panel.",
         msg_panel_unreachable: "⚠️ Panel is unreachable. Please check the configuration.",
+        btn_sub_link: "🔗 Subscription Link",
+        sub_link_sent: "✅ Subscription link sent!",
+        btn_update_usage: "🔄 Update Usage",
     },
     fa: {
         welcome: "🤖 **به ربات ترانزیت نهان خوش آمدید**\nجهت مدیریت سیستم نظارتی خود یکی از گزینه‌های زیر را انتخاب نمایید:",
@@ -1342,6 +1361,9 @@ const botI18n = {
         msg_panel_selected: "پنل انتخاب شد! ✅",
         msg_panel_error: "❌ اتصال به پنل انتخابی ناموفق بود.",
         msg_panel_unreachable: "⚠️ پنل در دسترس نیست. لطفاً پیکربندی را بررسی کنید.",
+        btn_sub_link: "🔗 لینک اشتراک",
+        sub_link_sent: "✅ لینک اشتراک ارسال شد!",
+        btn_update_usage: "🔄 بروزرسانی مصرف",
     }
 };
 
@@ -1428,18 +1450,6 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
         const adminId = sysConfig.tgAdminId || sysConfig.tgChatId;
         const isAuthorized = adminId && callerId === adminId.toString();
 
-        if (!isAuthorized && callerId) {
-            const chatId = update.callback_query?.message?.chat?.id || update.message?.chat?.id;
-            if (chatId) {
-                await fetch(`${tgApi}/sendMessage`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ chat_id: chatId, text: t("access_denied") })
-                });
-            }
-            return new Response("OK", { status: 200 });
-        }
-
         let tgState = {};
         try {
             const storedState = await d1Get(env, "tg_bot_state");
@@ -1488,6 +1498,10 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     })
                 });
                 if (res.ok) return res;
+                try {
+                    const errBody = await res.json();
+                    if (errBody?.description?.includes("message is not modified")) return res;
+                } catch (e) {}
             }
             res = await fetch(`${tgApi}/sendMessage`, {
                 method: 'POST',
@@ -1502,7 +1516,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             return res;
         };
 
-        const getMainMenu = (activePanel) => {
+        const getMainMenu = (activePanel, isAdmin = true) => {
             const isPaused = sysConfig.isPaused || false;
             const statusEmoji = isPaused ? "🔴" : "🟢";
             const users = sysConfig.users || [];
@@ -1519,39 +1533,47 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                          `👥 **${t("users")}**: ${users.length} (${activeCount} ${t("count_active")}, ${pausedCount} ${t("count_paused")}, ${autoDisabledCount} ${t("count_disabled")})\n` +
                          `━━━━━━━━━━━━━━━━`;
             const panelUrl = isLocal ? `https://${hostName}/${encodeURI(sysConfig.apiRoute)}/dash` : null;
+            const subUrl = `https://${hostName}/${sysConfig.apiRoute}`;
             /** @type {any} */
-            const kb = {
-                inline_keyboard: [
-                    [
-                        { text: `👥 ${t("users")}`, callback_data: "subs_list:0" },
-                        { text: `🔍 ${t("search")}`, callback_data: "sub_search_init" }
-                    ],
-                    [
-                        { text: `📊 ${t("dashboard")}`, callback_data: "sys_dashboard" },
-                        { text: `📈 ${t("statistics")}`, callback_data: "sys_stats" }
-                    ],
-                    [
-                        { text: `🚫 ${t("disabled_users")}`, callback_data: "subs_disabled:0" }
-                    ],
-                    [
-                        { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
-                        { text: isPaused ? t("btn_resume") : t("btn_pause"), callback_data: "sys_toggle_status" }
-                    ]
-                ]
-            };
+            const inline_keyboard = [];
+            if (isAdmin) {
+                inline_keyboard.push([
+                    { text: `👥 ${t("users")}`, callback_data: "subs_list:0" },
+                    { text: `🔍 ${t("search")}`, callback_data: "sub_search_init" }
+                ]);
+            }
+            inline_keyboard.push([
+                { text: `📊 ${t("dashboard")}`, callback_data: "sys_dashboard" },
+                { text: `📈 ${t("statistics")}`, callback_data: "sys_stats" }
+            ]);
+            inline_keyboard.push([
+                { text: `🔗 ${t("btn_sub_link")}`, callback_data: "get_sub_link" }
+            ]);
+            if (isAdmin) {
+                inline_keyboard.push([
+                    { text: `🚫 ${t("disabled_users")}`, callback_data: "subs_disabled:0" }
+                ]);
+            }
+            inline_keyboard.push([
+                { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
+                { text: isPaused ? t("btn_resume") : t("btn_pause"), callback_data: "sys_toggle_status" }
+            ]);
             if (panelUrl) {
-                kb.inline_keyboard.push([
+                inline_keyboard.push([
                     { text: `🔑 ${t("dash")}`, web_app: { url: panelUrl } },
                     { text: `ℹ️ ${t("panel_info")}`, callback_data: "sys_panel_info" }
                 ]);
-                kb.inline_keyboard.push([
-                    { text: `🚨 ${t("panic")}`, callback_data: "sys_panic_init" }
-                ]);
+                if (isAdmin) {
+                    inline_keyboard.push([
+                        { text: `🚨 ${t("panic")}`, callback_data: "sys_panic_init" }
+                    ]);
+                }
             } else {
-                kb.inline_keyboard.push([
+                inline_keyboard.push([
                     { text: `ℹ️ ${t("panel_info")}`, callback_data: "sys_panel_info" }
                 ]);
             }
+            const kb = { inline_keyboard };
             return { text, kb };
         };
 
@@ -1570,7 +1592,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 text += `⚠️ ${t("no_users")}\n`;
             } else {
                 pageUsers.forEach((u, idx) => {
-                    text += `${start + idx + 1}. 👤 **${u.name}**\n   <code>${u.id}</code>\n`;
+                    text += `${start + idx + 1}. 👤 **${u.name}**\n   \`${u.id}\`\n`;
                 });
             }
             text += `━━━━━━━━━━━━━━━━`;
@@ -1637,7 +1659,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             let text = `👤 **${t("sub_info")}**\n`;
             text += `━━━━━━━━━━━━━━━━\n`;
             text += `📛 **${t("name")}**: ${u.name}\n`;
-            text += `🆔 **UUID**: <code>${u.id}</code>\n`;
+            text += `🆔 **UUID**: \`${u.id}\`\n`;
             text += `🚦 **${t("lbl_status")}**: ${statusEmoji} ${statusText}\n`;
             text += `📊 **${t("total")}**: ${usedGB} GB / ${limitGB} GB (${userReqs} reqs)\n`;
             text += `⏱ **${t("daily")}**: ${userDReqs} / ${limitDailyTxt}\n`;
@@ -1646,7 +1668,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             text += `📱 **${t("device_limit")}**: ${maxCfgTxt}\n`;
             text += `📝 **${t("notes")}**: ${notesTxt}\n`;
             text += `━━━━━━━━━━━━━━━━\n`;
-            text += `🔗 **${t("lbl_subscription")}:**\n<code>${subSync}</code>`;
+            text += `🔗 **${t("lbl_subscription")}:**\n\`${subSync}\``;
             
             const kb = {
                 inline_keyboard: [
@@ -1698,18 +1720,31 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 tgState[chatId] = null;
                 await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
 
+                let answerText = null;
+
+                const adminOnlyActions = ["subs_list:", "sub_detail:", "sub_toggle:", "sub_del_init:", "sub_del_confirm:", "sub_add_init", "sub_add_unlimited_skip", "sub_edit_name_init:", "sub_edit_limits_init:", "sub_unlimit_cb:", "sub_reset_traffic:", "sub_extend_init:", "sub_edit_notes_init:", "sub_edit_device_init:", "sub_device_unlimited:", "subs_disabled:", "sub_search_init", "sys_panic_init", "sys_panic_confirm"];
+                const isAdminAction = adminOnlyActions.some(a => data === a || data.startsWith(a));
+                if (isAdminAction && !isAuthorized) {
+                    await fetch(`${tgApi}/answerCallbackQuery`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ callback_query_id: cb.id, text: t("access_denied"), show_alert: true })
+                    });
+                    return new Response("OK", { status: 200 });
+                }
+
                 if (data === "main_menu") {
-                    const menu = getMainMenu(activePanel);
+                    const menu = getMainMenu(activePanel, isAuthorized);
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_lang") {
                     sysConfig.tgBotLang = (langCode === "fa") ? "en" : "fa";
                     await d1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    const menu = getMainMenu(activePanel);
+                    const menu = getMainMenu(activePanel, isAuthorized);
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_toggle_status") {
                     sysConfig.isPaused = !sysConfig.isPaused;
                     await d1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    const menu = getMainMenu(activePanel);
+                    const menu = getMainMenu(activePanel, isAuthorized);
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_metrics") {
                     let usageStr = t("unlimited");
@@ -1968,7 +2003,17 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     statsText += `📊 **${t("total_traffic")}**: ${(totalReqs / 6000).toFixed(2)} GB\n`;
                     statsText += `📅 **${t("daily_traffic")}**: ${(dailyReqs / 6000).toFixed(2)} GB\n`;
                     statsText += `━━━━━━━━━━━━━━━━`;
-                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                    if (sysConfig.cfAccountId && sysConfig.cfApiToken) {
+                        const reqs = await fetchCloudflareUsage(sysConfig.cfAccountId, sysConfig.cfApiToken);
+                        if (reqs !== null) {
+                            const pct = ((reqs / 100000) * 100).toFixed(2);
+                            statsText += `\n☁️ **Cloudflare API**: ${reqs}/100000 (${pct}%)`;
+                        }
+                    }
+                    const kb = { inline_keyboard: [
+                        [{ text: `🔄 ${t("btn_update_usage")}`, callback_data: "sys_stats" }],
+                        [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
+                    ] };
                     await sendOrEdit(chatId, statsText, kb, messageId);
                 } else if (data === "sys_panel_info") {
                     let infoText = `ℹ️ **${t("panel_info")}**\n`;
@@ -2077,19 +2122,27 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     const panelUsers = await getPanelUsers();
                     const detail = getSubDetail(uuid, panelUsers);
                     await sendOrEdit(chatId, `✅ ${t("status_updated")}`, detail.kb, messageId);
+                } else if (data === "get_sub_link") {
+                    const subUrl = `https://${hostName}/${sysConfig.apiRoute}`;
+                    await fetch(`${tgApi}/sendMessage`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ chat_id: chatId, text: `\`${subUrl}\``, parse_mode: 'Markdown' })
+                    });
+                    answerText = t("sub_link_sent");
                 }
                 
                 await fetch(`${tgApi}/answerCallbackQuery`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ callback_query_id: cb.id, text: "Done!" })
+                    body: JSON.stringify({ callback_query_id: cb.id, text: answerText || "Done!" })
                 });
             }
         } else if (update.message && update.message.text) {
             const chatId = update.message.chat.id;
             const text = update.message.text.trim();
             
-            if (chatId.toString() === sysConfig.tgChatId.toString()) {
+            if (chatId.toString() === sysConfig.tgChatId.toString() || isAuthorized || (callerId && !isAuthorized)) {
                 // Get active panel from last login signal
                 const activePanel = getActivePanel();
                 const isRemotePanel = activePanel && !activePanel.isLocal;
@@ -2107,7 +2160,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 if (text === "/start") {
                     tgState[chatId] = null;
                     await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
-                    const menu = getMainMenu(activePanel);
+                    const menu = getMainMenu(activePanel, isAuthorized);
                     await sendOrEdit(chatId, menu.text, menu.kb);
                     return new Response("OK", { status: 200 });
                 }
@@ -2115,6 +2168,13 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 const state = tgState[chatId];
                 
                 if (state) {
+                    if (!isAuthorized) {
+                        tgState[chatId] = null;
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        await sendOrEdit(chatId, t("access_denied"));
+                        return new Response("OK", { status: 200 });
+                    }
+
                     if (state.step === "sub_add_name") {
                         const name = text;
                         tgState[chatId] = { step: "sub_add_limits", name: name };
@@ -2338,7 +2398,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 }
                 
                 // Default message / fallback menu
-                const menu = getMainMenu(activePanel);
+                const menu = getMainMenu(activePanel, isAuthorized);
                 await sendOrEdit(chatId, menu.text, menu.kb);
             }
         }
@@ -4577,6 +4637,26 @@ function getDashboardUI(hasDB) {
           };
 
           const CHANGELOG_DATA = {
+              "2.5.3": {
+                  headline: { en: "Telegram Bot Fixes & Formatting Cleanup", fa: "رفع مشکلات ربات تلگرام و اصلاح فرمت‌بندی" },
+                  added: [],
+                  fixed: [
+                      { en: "Fixed admin buttons not showing immediately after /start in some cases", fa: "رفع مشکل نمایش ندادن دکمه‌های مدیر بلافاصله پس از /start در بعضی موارد" },
+                      { en: "Fixed subscription link button returning per-user links instead of master link", fa: "رفع مشکل بازگشت لینک‌های کاربری به جای لینک اصلی هنگام فشردن دکمه لینک اشتراک" },
+                      { en: "Fixed duplicate messages when clicking Update Usage with unchanged stats", fa: "رفع مشکل ارسال پیام تکراری هنگام فشردن بروزرسانی مصرف بدون تغییر آمار" },
+                      { en: "Fixed <code> tags showing as raw text in Telegram messages", fa: "رفع مشکل نمایش تگ‌های <code> به صورت متن خام در پیام‌های تلگرام" },
+                      { en: "Fixed subscription links not being clickable in Telegram", fa: "رفع مشکل غیرقابل کلیک بودن لینک‌های اشتراک در تلگرام" },
+                  ],
+                  improved: [
+                      { en: "Subscription links now use tap-to-copy formatting in Telegram", fa: "لینک‌های اشتراک اکنون با فرمت کپی با یک لمس در تلگرام نمایش داده می‌شوند" },
+                      { en: "UUIDs now use tap-to-copy formatting in user lists and detail views", fa: "شناسه‌های یکتا اکنون با فرمت کپی با یک لمس در لیست و جزئیات کاربران نمایش داده می‌شوند" },
+                      { en: "Bot menu now correctly shows admin options on first interaction after login", fa: "منوی ربات اکنون گزینه‌های مدیریتی را در اولین تعامل پس از ورود به درستی نمایش می‌دهد" },
+                      { en: "Update Usage button now edits the existing message instead of sending a new one", fa: "دکمه بروزرسانی مصرف اکنون پیام موجود را ویرایش می‌کند به جای ارسال پیام جدید" },
+                  ],
+                  notes: [
+                      { en: "No breaking changes — fully backward compatible", fa: "بدون تغییرات ناسازگار — کاملاً سازگار با نسخه‌های قبلی" },
+                  ]
+              },
               "2.5.2": {
                   headline: { en: "Modal Responsiveness & Mobile UX", fa: "واکنش‌گرایی مودال و تجربه کاربری موبایل" },
                   added: [],
