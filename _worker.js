@@ -3925,7 +3925,7 @@ function getDashboardUI(hasDB) {
                                       <div class="p-2.5 bg-violet-500/10 text-violet-500 rounded-xl"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg></div>
                                       <span class="text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_total_traffic">Total Traffic</span>
                                   </div>
-                                  <p id="ov-total-traffic" class="text-xl font-black text-slate-800 dark:text-white">- GB</p>
+                                   <p id="ov-total-traffic" class="text-xl font-black text-slate-800 dark:text-white">- GB</p>
                                   <p class="text-[10px] text-slate-400 mt-1"><span id="ov-total-reqs">-</span> <span data-i18n="ov_requests">requests</span></p>
                               </div>
                               <div class="bg-white dark:bg-darkcard rounded-2xl p-5 shadow-sm border border-slate-200 dark:border-darkborder">
@@ -4947,6 +4947,13 @@ function getDashboardUI(hasDB) {
                       }
                   }
               });
+              const gbUnit = i18n[lang]?.ov_gb_unit || 'GB';
+              ['ov-total-traffic','ov-today-traffic'].forEach(id => {
+                  const el = document.getElementById(id);
+                  if (el && el.textContent.trim() === '- GB') el.textContent = '- ' + gbUnit;
+              });
+              const statTrafficEl = document.getElementById('stat-total-traffic');
+              if (statTrafficEl && statTrafficEl.textContent.trim() === '0 GB') statTrafficEl.textContent = '0 ' + gbUnit;
           }
           function toggleLang() { lang = lang === 'fa' ? 'en' : 'fa'; localStorage.setItem('lang', lang); applyLang(); updateTitle(); updateUI(); }
           applyLang();
