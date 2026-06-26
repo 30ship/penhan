@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.9.0";
+const CURRENT_VERSION = "2.6.0";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -62,8 +62,7 @@ const SYSTEM_DEFAULTS = {
     expiryMs: 0,
     linkedPanels: [],
     hubPanelUrl: "",
-    syncApiKey: "",
-    panelApiKeys: [],
+    allowSyncWorker: false,
     nat64Prefix: "",
     enableDirectConfigs: false,
     autoUpdate: false,
@@ -78,7 +77,6 @@ let sysConfig = { ...SYSTEM_DEFAULTS };
 let isolateStartTime = 0;
 let activeConnections = 0;
 let uuidUsage = new Map();
-let activeConns = new Map();
 let activeDeviceId = "";
 let configRegistry = new Map();
 
@@ -188,10 +186,7 @@ function getTrojanHash(uuid) {
 }
 
 function registerConfigEntry(uuid, userId, relayIp) {
-    const entry = { userId, relayIp: relayIp || '' };
-    configRegistry.set(uuid.replace(/-/g, '').toLowerCase(), entry);
-    const hashKey = getTrojanHash(uuid);
-    configRegistry.set(hashKey, entry);
+    configRegistry.set(uuid.replace(/-/g, '').toLowerCase(), { userId, relayIp: relayIp || '' });
 }
 
 function lookupConfigEntry(uuidHex) {
@@ -212,33 +207,6 @@ function decodeConfigUuid(uuid) {
     const userFingerprint = cleanUuid.substring(0, 24);
     const relayIpIndex = parseInt(cleanUuid.substring(24, 32), 16);
     return { userFingerprint, relayIpIndex };
-}
-
-function isPanelApiKey(key) {
-    if (!key || !sysConfig.panelApiKeys || !Array.isArray(sysConfig.panelApiKeys)) return false;
-    return sysConfig.panelApiKeys.some(k => k.key === key);
-}
-
-function extractAuthKey(request, data) {
-    const authHeader = request.headers.get("Authorization") || "";
-    const authKey = authHeader.replace("Bearer ", "") || "";
-    let bodyKey = "";
-    if (data && typeof data === "object") bodyKey = data.key || "";
-    const url = new URL(request.url);
-    const urlKey = url.searchParams.get("key") || "";
-    return authKey || bodyKey || urlKey;
-}
-
-function isAuthorized(request, data) {
-    const key = extractAuthKey(request, data);
-    return key === sysConfig.masterKey || isPanelApiKey(key);
-}
-
-function generateApiKey(name) {
-    const id = crypto.randomUUID();
-    const raw = `nahan_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-    const key = raw;
-    return { id, name: name || "Unnamed Key", key, createdAt: Date.now(), lastUsed: null };
 }
 
 function trackUsage(uuid, bytes, env, ctx) {
@@ -331,15 +299,13 @@ export default {
                 users: `/${encodeURI(sysConfig.apiRoute)}/api/users`,
                 stats: `/${encodeURI(sysConfig.apiRoute)}/api/stats`,
                 update: `/${encodeURI(sysConfig.apiRoute)}/api/update`,
-                apiKeys: `/${encodeURI(sysConfig.apiRoute)}/api/keys`,
             };
 
             const isSyncRoute = reqPath.endsWith('/api/sync');
             const isUsersRoute = reqPath === routes.users || reqPath.endsWith('/api/users');
             const isStatsRoute = reqPath === routes.stats || reqPath.endsWith('/api/stats');
             const isUpdateRoute = reqPath === routes.update || reqPath.endsWith('/api/update');
-            const isApiKeysRoute = reqPath === routes.apiKeys || reqPath.endsWith('/api/keys');
-            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.syncPanel || reqPath === routes.logs || isSyncRoute || isUsersRoute || isStatsRoute || isUpdateRoute || isApiKeysRoute;
+            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.syncPanel || reqPath === routes.logs || isSyncRoute || isUsersRoute || isStatsRoute || isUpdateRoute;
 
             if (!isTelemetryStream && !isAuthorizedRoute) {
                 return serveMaintenancePage(request, url);
@@ -354,14 +320,8 @@ export default {
                     return await handleAuth(request, url.hostname, ctx, env);
                 }
                 if (reqPath === routes.sync || isSyncRoute) {
-                    if (request.method === "OPTIONS") {
-                        return new Response(null, { status: 204, headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization", "Access-Control-Max-Age": "86400" } });
-                    }
                     if (request.method !== "POST") return new Response("405", { status: 405 });
-                    const syncRes = await handleConfigSync(request, env, ctx);
-                    syncRes.headers.set("Access-Control-Allow-Origin", "*");
-                    syncRes.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-                    return syncRes;
+                    return await handleConfigSync(request, env, ctx);
                 }
                 if (reqPath === routes.logs) {
                     if (request.method !== "POST" && request.method !== "GET") return new Response("405", { status: 405 });
@@ -375,9 +335,6 @@ export default {
                 }
                 if (isUpdateRoute) {
                     return await handleUpdateApi(request, env, ctx);
-                }
-                if (isApiKeysRoute) {
-                    return await handleApiKeys(request, env, ctx);
                 }
                 if (reqPath === routes.syncPanel) {
                     if (request.method !== "POST") return new Response("405", { status: 405 });
@@ -521,30 +478,7 @@ export default {
 
             if (isTelemetryStream) {
                 if (sysConfig.isPaused) return new Response(null, { status: 503 });
-                let wsRelayIdx = -1;
-                try {
-                    const riParam = url.searchParams.get('ri');
-                    if (riParam !== null) wsRelayIdx = parseInt(riParam, 10);
-                } catch(e) {}
-                if (wsRelayIdx < 0) {
-                    try {
-                        const lastSeg = url.pathname.split('/').pop();
-                        if (lastSeg) {
-                            const num = parseInt(lastSeg, 10);
-                            if (!isNaN(num) && num >= 0) wsRelayIdx = num;
-                        }
-                    } catch(e) {}
-                }
-                if (wsRelayIdx < 0) {
-                    try {
-                        const lastSeg = url.pathname.split('/').pop();
-                        if (lastSeg) {
-                            const decoded = JSON.parse(atob(lastSeg));
-                            if (typeof decoded.relayIdx === 'number') wsRelayIdx = decoded.relayIdx;
-                        }
-                    } catch(e) {}
-                }
-                return await processTelemetryStream(env, ctx, wsRelayIdx);
+                return await processTelemetryStream(env, ctx);
             }
 
             return new Response(null, { status: 404 });
@@ -611,12 +545,8 @@ function serveSubscriptionInfoPage(user, host, url, request) {
     else if (limitDaily && dailyReqs >= limitDaily) statusCode = 'dailyLimit';
 
     let cleanUrl = new URL(url.href);
-    let panelUrlToUse = sysConfig.customPanelUrl;
-    if (user.userPanelUrl && user.userPanelUrl.trim()) {
-        panelUrlToUse = user.userPanelUrl.trim();
-    }
-    if (panelUrlToUse) {
-        let customUrlStr = panelUrlToUse;
+    if (sysConfig.customPanelUrl && sysConfig.customPanelUrl.trim()) {
+        let customUrlStr = sysConfig.customPanelUrl.trim();
         if (!customUrlStr.startsWith('http://') && !customUrlStr.startsWith('https://')) {
             customUrlStr = 'https://' + customUrlStr;
         }
@@ -1259,7 +1189,7 @@ async function handleLogs(request, env) {
     try {
         if (request.method === "POST") {
             const data = await request.json();
-            if (!isAuthorized(request, data)) return new Response(JSON.stringify({ success: false }), { status: 401 });
+            if (data.key !== sysConfig.masterKey) return new Response(JSON.stringify({ success: false }), { status: 401 });
             let logs = [];
             if (env.IOT_DB) {
                 const stored = await d1Get(env, "sys_logs");
@@ -1287,7 +1217,7 @@ async function handleUsersApi(request, env, ctx) {
                 bodyKey = body.key || "";
             } catch(e) {}
         }
-        const isAuth = (authKey === sysConfig.masterKey) || (bodyKey === sysConfig.masterKey) || isPanelApiKey(authKey) || isPanelApiKey(bodyKey);
+        const isAuth = (authKey === sysConfig.masterKey) || (bodyKey === sysConfig.masterKey);
         if (!isAuth) {
             return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
         }
@@ -1333,7 +1263,7 @@ async function handleUsersApi(request, env, ctx) {
 
         if (method === "POST" && !userId) {
             const body = await request.json();
-            const { name, trafficLimit, expiryDays, notes, maxConfigs, proxyIp, cleanIp, userMode, userPorts, userNodes, nat64, connLimit, userPanelUrl } = body;
+            const { name, trafficLimit, expiryDays, notes, maxConfigs, proxyIp, cleanIp, userMode, userPorts, userNodes, nat64 } = body;
             if (!name) return new Response(JSON.stringify({ success: false, error: "Name is required" }), { status: 400, headers: { "Content-Type": "application/json" } });
             const newId = crypto.randomUUID();
             const newUser = {
@@ -1350,8 +1280,6 @@ cleanIp: cleanIp || null,
                 userPorts: userPorts || null,
                 userNodes: userNodes || null,
                 nat64: nat64 || null,
-                connLimit: connLimit ? parseInt(connLimit) : null,
-                userPanelUrl: userPanelUrl || null,
                 createdAt: Date.now()
             };
             await resolveUserProxyIpGeo(newUser);
@@ -1381,8 +1309,6 @@ cleanIp: cleanIp || null,
             if (body.userPorts !== undefined) u.userPorts = body.userPorts;
             if (body.userNodes !== undefined) u.userNodes = body.userNodes;
             if (body.nat64 !== undefined) u.nat64 = body.nat64;
-            if (body.connLimit !== undefined) u.connLimit = body.connLimit ? parseInt(body.connLimit) : null;
-            if (body.userPanelUrl !== undefined) u.userPanelUrl = body.userPanelUrl || null;
             if (body.status !== undefined) {
                 if (body.status === "active") { u.isPaused = false; u.disabledReason = null; u.disabledAt = null; }
                 else if (body.status === "paused") { u.isPaused = true; u.disabledReason = null; u.disabledAt = null; }
@@ -1437,7 +1363,7 @@ async function handleStatsApi(request, env) {
         const url = new URL(request.url);
         const authHeader = request.headers.get("Authorization") || "";
         const authKey = authHeader.replace("Bearer ", "") || url.searchParams.get("key") || "";
-        if (authKey !== sysConfig.masterKey && !isPanelApiKey(authKey)) {
+        if (authKey !== sysConfig.masterKey) {
             return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
         }
 
@@ -1487,7 +1413,7 @@ async function handleUpdateApi(request, env, ctx) {
     try {
         if (request.method !== "POST") return new Response("405", { status: 405 });
         const data = await request.json();
-        if (!isAuthorized(request, data)) {
+        if (data.key !== sysConfig.masterKey) {
             return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
         }
 
@@ -1575,66 +1501,12 @@ async function handleUpdateApi(request, env, ctx) {
     }
 }
 
-async function handleApiKeys(request, env, ctx) {
-    try {
-        const url = new URL(request.url);
-        const method = request.method;
-
-        const authKey = extractAuthKey(request, null);
-        if (authKey !== sysConfig.masterKey) {
-            return new Response(JSON.stringify({ success: false, error: "Only master key can manage API keys" }), { status: 401, headers: { "Content-Type": "application/json" } });
-        }
-
-        if (method === "GET") {
-            const keys = (sysConfig.panelApiKeys || []).map(k => ({
-                id: k.id, name: k.name, keyPreview: k.key.slice(0, 8) + "..." + k.key.slice(-4),
-                createdAt: k.createdAt, lastUsed: k.lastUsed
-            }));
-            return new Response(JSON.stringify({ success: true, keys }), { headers: { "Content-Type": "application/json" } });
-        }
-
-        if (method === "POST") {
-            const body = await request.json();
-            if (body.action === "create") {
-                if (!sysConfig.panelApiKeys) sysConfig.panelApiKeys = [];
-                if (sysConfig.panelApiKeys.length >= 10) {
-                    return new Response(JSON.stringify({ success: false, error: "Maximum 10 API keys allowed" }), { status: 400, headers: { "Content-Type": "application/json" } });
-                }
-                const newKey = generateApiKey(body.name);
-                sysConfig.panelApiKeys.push(newKey);
-                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                ctx?.waitUntil(logActivity(env, "API Key Created", `Key "${newKey.name}" created`).catch(()=>{}));
-                return new Response(JSON.stringify({ success: true, key: newKey }), { status: 201, headers: { "Content-Type": "application/json" } });
-            }
-            if (body.action === "revoke") {
-                if (!body.id) return new Response(JSON.stringify({ success: false, error: "ID required" }), { status: 400, headers: { "Content-Type": "application/json" } });
-                const idx = (sysConfig.panelApiKeys || []).findIndex(k => k.id === body.id);
-                if (idx === -1) return new Response(JSON.stringify({ success: false, error: "Key not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
-                const revoked = sysConfig.panelApiKeys.splice(idx, 1)[0];
-                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                ctx?.waitUntil(logActivity(env, "API Key Revoked", `Key "${revoked.name}" revoked`).catch(()=>{}));
-                return new Response(JSON.stringify({ success: true, revoked: revoked.id }), { headers: { "Content-Type": "application/json" } });
-            }
-        }
-
-        return new Response(JSON.stringify({ success: false, error: "Invalid request" }), { status: 400, headers: { "Content-Type": "application/json" } });
-    } catch(e) {
-        return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
-    }
-}
-
 async function handleAuth(request, hostName, ctx, env) {
     try {
         const data = await request.json();
         const ip = request.headers.get("cf-connecting-ip") || "Unknown";
-        const loginKey = data.key || "";
-        const isKeyAuth = loginKey === sysConfig.masterKey || isPanelApiKey(loginKey);
-        if (isKeyAuth) {
-            if (isPanelApiKey(loginKey)) {
-                const apiKeyEntry = (sysConfig.panelApiKeys || []).find(k => k.key === loginKey);
-                if (apiKeyEntry) apiKeyEntry.lastUsed = Date.now();
-            }
-            ctx?.waitUntil(logActivity(env, "Auth Success", `Successful panel login from ${ip} (via ${isPanelApiKey(loginKey) ? 'API Key' : 'Master Key'})`));
+        if (data.key === sysConfig.masterKey) {
+            ctx?.waitUntil(logActivity(env, "Auth Success", `Successful panel login from ${ip}`));
             if (!sysConfig.silentAlerts && ctx) ctx.waitUntil(sendTelegramMessage(request, "ورود به پنل (موفق)", hostName));
 
             // Store login signal for Telegram bot
@@ -1693,7 +1565,7 @@ async function handleAuth(request, hostName, ctx, env) {
                 } catch(e) {}
             }
             return new Response(JSON.stringify({
-                success: true, config: isPanelApiKey(loginKey) ? { ...sysConfig, masterKey: "[PROTECTED]", panelApiKeys: "[PROTECTED]" } : sysConfig, deviceId: activeDeviceId, network: netInfo, usage: usageData, sysUsage: (sysUsageCache && sysUsageCache.users) ? sysUsageCache.users : {},
+                success: true, config: sysConfig, deviceId: activeDeviceId, network: netInfo, usage: usageData, sysUsage: (sysUsageCache && sysUsageCache.users) ? sysUsageCache.users : {},
                 version: CURRENT_VERSION,
                 profiles: getAllProfiles().map(p => {
                     let subSuffix = p.name === 'Default' ? '' : '?sub=' + encodeURIComponent(p.name);
@@ -1714,21 +1586,18 @@ async function handleAuth(request, hostName, ctx, env) {
 async function handleConfigSync(request, env, ctx) {
     try {
         const data = await request.json();
-        const isAuthSync = (data.key === sysConfig.masterKey) || 
+        const isAuthorized = (data.key === sysConfig.masterKey) || 
                              (data.oldKey && data.oldKey === sysConfig.masterKey) || 
-                             (sysConfig.masterKey === "admin") ||
-                             isPanelApiKey(data.key) || isPanelApiKey(data.oldKey) ||
-                             (data.fromMaster && data.config && data.config.masterKey && data.config.masterKey === sysConfig.masterKey);
-        if (!isAuthSync) return new Response(JSON.stringify({ success: false, error: "Auth failed. Generate the API key on THIS panel, not the main panel." }), { status: 401 });
+                             (sysConfig.masterKey === "admin");
+        if (!isAuthorized) return new Response(JSON.stringify({ success: false }), { status: 401 });
+        if (data.fromMaster && !sysConfig.allowSyncWorker) {
+    return new Response(JSON.stringify({ success: false, error: "Sync not allowed" }), { status: 403 });
+}
         if (!env.IOT_DB) return new Response(JSON.stringify({ success: false, msg: "DB Error" }), { status: 400 });
         
         let nextConfig = sysConfig;
         if (data.config) {
-            const preserveApiKeys = sysConfig.panelApiKeys || [];
             nextConfig = { ...sysConfig, ...data.config };
-            if (preserveApiKeys.length > 0 && (!data.config.panelApiKeys || data.config.panelApiKeys.length === 0)) {
-                nextConfig.panelApiKeys = preserveApiKeys;
-            }
             if (Array.isArray(nextConfig.users) && nextConfig.users.length > 0) {
                 const geoPromises = nextConfig.users.map(async (u) => {
                     if (u.proxyIp) {
@@ -1762,16 +1631,16 @@ async function handleConfigSync(request, env, ctx) {
             await cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
         }
 
+        const oldMasterKey = sysConfig.masterKey;
         if (data.config && !data.fromMaster && nextConfig.slaveNodes && nextConfig.slaveNodes.trim().length > 0) {
             let nodes = nextConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean);
-            let syncKey = nextConfig.syncApiKey || '';
             let currentHost = new URL(request.url).hostname;
             nodes.forEach(node => {
                 if(node !== currentHost) {
                      ctx?.waitUntil(fetch(`https://${node}/${encodeURI(nextConfig.apiRoute)}/api/sync`, {
                          method: 'POST',
                          headers: { 'Content-Type': 'application/json' },
-                         body: JSON.stringify({ key: syncKey, config: nextConfig, fromMaster: true })
+                         body: JSON.stringify({ key: nextConfig.masterKey, oldKey: oldMasterKey, config: nextConfig, fromMaster: true })
                      }).catch(() => {}));
                 }
             });
@@ -1923,7 +1792,7 @@ const botI18n = {
         tg_saved: "Saved!", tg_cancelled: "Cancelled",
         tg_log_entry: "", tg_log_empty: "No logs found",
         tg_u_custom_name: "Custom Name", tg_u_clean_ips: "Clean IPs", tg_u_proxy_ips: "Proxy IPs",
-        tg_u_nodes: "Nodes", tg_u_nat64: "NAT64", tg_u_mode: "Protocol Mode", tg_u_ports: "Ports", tg_u_conn_limit: "Conn Limit", tg_u_panel_url: "Panel URL",
+        tg_u_nodes: "Nodes", tg_u_nat64: "NAT64", tg_u_mode: "Protocol Mode", tg_u_ports: "Ports",
         tg_u_max_cfg: "Max Configs", tg_u_all: "All Settings",
         tg_network: "Network", tg_uptime: "Uptime", tg_conns: "Active Connections",
         tg_version: "Version", tg_cf_usage: "CF Usage",
@@ -2029,7 +1898,7 @@ const botI18n = {
         tg_saved: "ذخیره شد!", tg_cancelled: "لغو شد",
         tg_log_entry: "", tg_log_empty: "گزارشی ثبت نشده",
         tg_u_custom_name: "نام سفارشی", tg_u_clean_ips: "آی‌پی تمیز", tg_u_proxy_ips: "آی‌پی پروکسی",
-        tg_u_nodes: "نودها", tg_u_nat64: "NAT64", tg_u_mode: "پروتکل", tg_u_ports: "پورت‌ها", tg_u_conn_limit: "محدودیت اتصال", tg_u_panel_url: "آدرس پنل",
+        tg_u_nodes: "نودها", tg_u_nat64: "NAT64", tg_u_mode: "پروتکل", tg_u_ports: "پورت‌ها",
         tg_u_max_cfg: "حداکثر کانفیگ", tg_u_all: "همه تنظیمات",
         tg_network: "شبکه", tg_uptime: "زمان کارکرد", tg_conns: "اتصالات فعال",
         tg_version: "نسخه", tg_cf_usage: "مصرف کلودفلر",
@@ -2042,7 +1911,7 @@ function getPanelsList() {
         name: sysConfig.name || "Main Panel",
         host: null,
         apiRoute: sysConfig.apiRoute,
-        apiKey: null,
+        masterKey: null,
         isLocal: true
     });
     if (sysConfig.linkedPanels && Array.isArray(sysConfig.linkedPanels)) {
@@ -2052,7 +1921,7 @@ function getPanelsList() {
                     name: p.name || p.host,
                     host: p.host,
                     apiRoute: p.apiRoute || sysConfig.apiRoute,
-                    apiKey: p.apiKey || p.masterKey || null,
+                    masterKey: p.masterKey,
                     isLocal: false
                 });
             }
@@ -2077,34 +1946,34 @@ async function remotePanelFetch(panel, method, path, body = null) {
 }
 
 async function fetchRemotePanelUsers(panel) {
-    return await remotePanelFetch(panel, 'GET', `/api/users?key=${encodeURIComponent(panel.apiKey)}`);
+    return await remotePanelFetch(panel, 'GET', `/api/users?key=${encodeURIComponent(panel.masterKey)}`);
 }
 
 async function fetchRemotePanelUser(panel, userId) {
-    return await remotePanelFetch(panel, 'GET', `/api/users?id=${encodeURIComponent(userId)}&key=${encodeURIComponent(panel.apiKey)}`);
+    return await remotePanelFetch(panel, 'GET', `/api/users?id=${encodeURIComponent(userId)}&key=${encodeURIComponent(panel.masterKey)}`);
 }
 
 async function fetchRemotePanelStats(panel) {
-    return await remotePanelFetch(panel, 'GET', `/api/stats?key=${encodeURIComponent(panel.apiKey)}`);
+    return await remotePanelFetch(panel, 'GET', `/api/stats?key=${encodeURIComponent(panel.masterKey)}`);
 }
 
 async function fetchRemotePanelConfig(panel) {
-    return await remotePanelFetch(panel, 'POST', '/api/auth', { key: panel.apiKey });
+    return await remotePanelFetch(panel, 'POST', '/api/auth', { key: panel.masterKey });
 }
 
 async function remotePanelWriteAction(panel, method, userId, body = null) {
     let path = '/api/users';
-    if (userId) path += `?id=${encodeURIComponent(userId)}&key=${encodeURIComponent(panel.apiKey)}`;
-    else path += `?key=${encodeURIComponent(panel.apiKey)}`;
-    return await remotePanelFetch(panel, method, path, body || { key: panel.apiKey });
+    if (userId) path += `?id=${encodeURIComponent(userId)}&key=${encodeURIComponent(panel.masterKey)}`;
+    else path += `?key=${encodeURIComponent(panel.masterKey)}`;
+    return await remotePanelFetch(panel, method, path, body || { key: panel.masterKey });
 }
 
 async function remotePanelToggleUser(panel, userId) {
-    return await remotePanelFetch(panel, 'POST', `/api/users?id=${encodeURIComponent(userId)}&action=toggle&key=${encodeURIComponent(panel.apiKey)}`);
+    return await remotePanelFetch(panel, 'POST', `/api/users?id=${encodeURIComponent(userId)}&action=toggle&key=${encodeURIComponent(panel.masterKey)}`);
 }
 
 async function remotePanelResetTraffic(panel, userId) {
-    return await remotePanelFetch(panel, 'POST', `/api/users?id=${encodeURIComponent(userId)}&action=reset&key=${encodeURIComponent(panel.apiKey)}`);
+    return await remotePanelFetch(panel, 'POST', `/api/users?id=${encodeURIComponent(userId)}&action=reset&key=${encodeURIComponent(panel.masterKey)}`);
 }
 
 async function handleTelegramWebhook(request, env, hostName, ctx) {
@@ -2160,7 +2029,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     name: lastLoginPanel.name || lastLoginPanel.host,
                     host: lastLoginPanel.host,
                     apiRoute: lastLoginPanel.apiRoute || sysConfig.apiRoute,
-                    apiKey: lastLoginPanel.apiKey || lastLoginPanel.masterKey || null,
+                    masterKey: lastLoginPanel.masterKey,
                     isLocal: false
                 };
             }
@@ -2370,8 +2239,6 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             text += `🔗 **${t("tg_u_proxy_ips")}**: ${proxyIpsTxt}\n`;
             text += `🖥️ **${t("tg_u_nodes")}**: ${nodesTxt}\n`;
             text += `🌐 **${t("tg_u_nat64")}**: ${nat64Txt}\n`;
-            text += `🔗 **${t("tg_u_conn_limit")}**: ${u.connLimit || t("unlimited")}\n`;
-            text += `🎛 **${t("tg_u_panel_url")}**: ${u.userPanelUrl || t("unlimited")}\n`;
             text += `📝 **${t("notes")}**: ${notesTxt}\n`;
             text += `━━━━━━━━━━━━━━━━\n`;
             text += `🔗 **${t("lbl_subscription")}:**\n\`${subSync}\``;
@@ -2558,7 +2425,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 } else if (data.startsWith("sub_unlimit_cb:")) {
                     const uuid = data.replace("sub_unlimit_cb:", "");
                     if (isRemotePanel) {
-                        await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.apiKey, trafficLimit: 0, dailyLimit: 0, expiryDays: 0 });
+                        await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, trafficLimit: 0, dailyLimit: 0, expiryDays: 0 });
                     } else if (sysConfig.users) {
                         const u = sysConfig.users.find(usr => usr.id === uuid);
                         if (u) {
@@ -2585,7 +2452,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     
                     const newUuid = crypto.randomUUID();
                     if (isRemotePanel) {
-                        const res = await remotePanelWriteAction(activePanel, 'POST', null, { key: activePanel.apiKey, name: stateName });
+                        const res = await remotePanelWriteAction(activePanel, 'POST', null, { key: activePanel.masterKey, name: stateName });
                         if (res.success && res.user) {
                             const detail = getSubDetail(res.user.id, [res.user]);
                             await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb, messageId);
@@ -2823,7 +2690,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 } else if (data.startsWith("sub_device_unlimited:")) {
                     const uuid = data.replace("sub_device_unlimited:", "");
                     if (isRemotePanel) {
-                        await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.apiKey, maxConfigs: null });
+                        await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, maxConfigs: null });
                     } else if (sysConfig.users) {
                         const u = sysConfig.users.find(usr => usr.id === uuid);
                         if (u) {
@@ -3113,7 +2980,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         const newUuid = crypto.randomUUID();
                         if (isRemotePanel) {
                             const res = await remotePanelWriteAction(activePanel, 'POST', null, {
-                                key: activePanel.apiKey,
+                                key: activePanel.masterKey,
                                 name: name,
                                 trafficLimit: tReq ? tReq / 6000 : 0,
                                 dailyLimit: dReq ? dReq / 6000 : 0,
@@ -3148,7 +3015,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     if (state.step.startsWith("sub_edit_name:")) {
                         const uuid = state.step.replace("sub_edit_name:", "");
                         if (isRemotePanel) {
-                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.apiKey, name: text });
+                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, name: text });
                         } else if (sysConfig.users) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
@@ -3178,7 +3045,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         
                         if (isRemotePanel) {
                             await remotePanelWriteAction(activePanel, 'PUT', uuid, {
-                                key: activePanel.apiKey,
+                                key: activePanel.masterKey,
                                 trafficLimit: tReq ? tReq / 6000 : 0,
                                 dailyLimit: dReq ? dReq / 6000 : 0,
                                 expiryDays: days || 0
@@ -3233,7 +3100,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             return new Response("OK", { status: 200 });
                         }
                         if (isRemotePanel) {
-                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.apiKey, expiryDays: days });
+                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, expiryDays: days });
                         } else if (sysConfig.users) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
@@ -3262,7 +3129,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     if (state.step.startsWith("sub_edit_notes:")) {
                         const uuid = state.step.replace("sub_edit_notes:", "");
                         if (isRemotePanel) {
-                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.apiKey, notes: text });
+                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, notes: text });
                         } else if (sysConfig.users) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
@@ -3286,7 +3153,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             return new Response("OK", { status: 200 });
                         }
                         if (isRemotePanel) {
-                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.apiKey, maxConfigs: limit > 0 ? limit : null });
+                            await remotePanelWriteAction(activePanel, 'PUT', uuid, { key: activePanel.masterKey, maxConfigs: limit > 0 ? limit : null });
                         } else if (sysConfig.users) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
@@ -3472,30 +3339,18 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
     }
 }
 
-async function processTelemetryStream(env, ctx, wsRelayIdx) {
+async function processTelemetryStream(env, ctx) {
     const [client, webSocket] = Object.values(new WebSocketPair());
     webSocket.accept();
     webSocket.binaryType = "arraybuffer";
-    startDataPipe(webSocket, env, ctx, wsRelayIdx);
+    startDataPipe(webSocket, env, ctx);
     return new Response(null, { status: 101, webSocket: client });
 }
 
-async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
+async function startDataPipe(webSocket, env, ctx) {
     activeConnections++;
-    webSocket.addEventListener('close', () => {
-        activeConnections--;
-        if (activeClientHash) {
-            let cur = activeConns.get(activeClientHash) || 0;
-            if (cur > 0) activeConns.set(activeClientHash, cur - 1);
-        }
-    });
-    webSocket.addEventListener('error', () => {
-        activeConnections--;
-        if (activeClientHash) {
-            let cur = activeConns.get(activeClientHash) || 0;
-            if (cur > 0) activeConns.set(activeClientHash, cur - 1);
-        }
-    });
+    webSocket.addEventListener('close', () => activeConnections--);
+    webSocket.addEventListener('error', () => activeConnections--);
     let remoteSocket, dataWriter, isInit = true, queue = Promise.resolve();
     let activeClientHash = null;
     webSocket.addEventListener("message", (event) => {
@@ -3503,7 +3358,7 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
             try {
                 if (isInit) {
                     isInit = false;
-                    const isModeAlpha = await parseSensorData(event.data, wsRelayIdx);
+                    const isModeAlpha = await parseSensorData(event.data);
                     if (isModeAlpha) webSocket.send(new Uint8Array([0, 0]));
                 } else if (dataWriter) {
                     await dataWriter.write(event.data);
@@ -3512,7 +3367,7 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
         });
     });
 
-    async function parseSensorData(bufferData, wsRelayIdx) {
+    async function parseSensorData(bufferData) {
         const view = new Uint8Array(bufferData);
         let targetAddr = "", targetPort = 0, offset = 0, isModeAlpha = false, activeProfile = null;
 
@@ -3547,15 +3402,6 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
             }
             trackUsage(activeClientHash, 0, env, ctx);
             
-            if (activeProfile && activeProfile.connLimit) {
-                let currentConns = activeConns.get(activeClientHash) || 0;
-                if (currentConns >= activeProfile.connLimit) {
-                    webSocket.close();
-                    return isModeAlpha;
-                }
-                activeConns.set(activeClientHash, currentConns + 1);
-            }
-            
             let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
             uTrack.connects++;
             uTrack.last = Date.now();
@@ -3587,28 +3433,14 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
                 activeProfile = getAllProfiles().find(p => getTrojanHash(p.id) === clientHashHex);
                 if (!activeProfile) return false;
                 activeClientHash = activeProfile.id.replace(/-/g, '').toLowerCase();
-                if (wsRelayIdx >= 0) {
-                    const effectivePips = getEffectivePips(activeProfile);
-                    if (effectivePips.length > 0) {
-                        activeProfile = { ...activeProfile, proxyIp: effectivePips[wsRelayIdx % effectivePips.length] };
-                    }
-                }
             }
             trackUsage(activeClientHash, 0, env, ctx);
-            if (activeProfile && activeProfile.connLimit) {
-                let currentConns = activeConns.get(activeClientHash) || 0;
-                if (currentConns >= activeProfile.connLimit) {
-                    webSocket.close();
-                    return isModeAlpha;
-                }
-                activeConns.set(activeClientHash, currentConns + 1);
-            }
             let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
             uTrack.connects++;
             uTrack.last = Date.now();
             uuidUsage.set(activeClientHash, uTrack);
 
-            let hPos = ePos + 2; hPos++;
+            let hPos = ePos + 2; hPos++; hPos++;
             let aType = view[hPos]; hPos++; let aLen = 0;
 
             if (aType === 1) { aLen = 4; targetAddr = view.slice(hPos, hPos + aLen).join("."); }
@@ -3617,7 +3449,7 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
 
             hPos += aLen;
             targetPort = new DataView(bufferData.slice(hPos, hPos + 2)).getUint16(0);
-            offset = hPos + 4;
+            offset = hPos + 2;
         }
 
         let isDomain = /^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$/.test(targetAddr) || /^[a-zA-Z0-9-]+$/.test(targetAddr);
@@ -3796,7 +3628,7 @@ function getAllProfiles(targetSub = null) {
                 if (usr.lastDay === new Date().toISOString().split('T')[0] && usr.dReqs >= u.limitDailyReq) skip = true;
             }
             if(!skip) {
-                list.push({ id: u.id, name: u.name, proxyIp: u.proxyIp, cleanIp: u.cleanIp || null, userMode: u.userMode || null, userPorts: u.userPorts || null, maxConfigs: u.maxConfigs || null, proxyIpGeo: u.proxyIpGeo || null, userNodes: u.userNodes || null, nat64: u.nat64 || null, connLimit: u.connLimit || null, userPanelUrl: u.userPanelUrl || null });
+                list.push({ id: u.id, name: u.name, proxyIp: u.proxyIp, cleanIp: u.cleanIp || null, userMode: u.userMode || null, userPorts: u.userPorts || null, maxConfigs: u.maxConfigs || null, proxyIpGeo: u.proxyIpGeo || null, userNodes: u.userNodes || null, nat64: u.nat64 || null });
                 registerConfigEntry(u.id, u.id, u.proxyIp || '');
             }
         });
@@ -4037,8 +3869,7 @@ function calcEffectiveIps(ips, maxCfg, effectiveMode, effectivePorts) {
 }
 
 function getProfileHostNames(hostName, profile) {
-    let primaryHost = (profile && profile.userPanelUrl) ? profile.userPanelUrl : hostName;
-    let names = [primaryHost];
+    let names = [hostName];
     if (profile && profile.userNodes) {
         names.push(...profile.userNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
     } else if (sysConfig.slaveNodes) {
@@ -4115,13 +3946,9 @@ async function buildUriProfile(hostName, targetSub = null, allowInsecure = false
                         lines.push(`${getAlpha()}://${configUuid}@${ip}:${port}?${extBase}#${vName}`);
                     }
                     if (effectiveMode === "beta" || effectiveMode === "both") {
-                        let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                        let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
-                        let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
-                        let trojanExtBase = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${encodeURIComponent(pathStrTr)}`;
-                        if (sysConfig.enableOpt2) trojanExtBase += `&pbk=enabled`;
-                        trojanExtBase += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
-                        lines.push(`${getBeta()}://${p.id}@${ip}:${port}?${trojanExtBase}#${tName}`);
+                        let configUuid = generateConfigUuid(p.id, configIndex);
+                        registerConfigEntry(configUuid, p.id, selectedProxyIp || '');
+                        lines.push(`${getBeta()}://${configUuid}@${ip}:${port}?${extBase}#${tName}`);
                     }
                     if (sysConfig.enableDirectConfigs && pips.length > 0) {
                         configIndex++;
@@ -4133,13 +3960,9 @@ async function buildUriProfile(hostName, targetSub = null, allowInsecure = false
                             lines.push(`${getAlpha()}://${configUuid}@${ip}:${port}?${extBase}#${dvName}`);
                         }
                         if (effectiveMode === "beta" || effectiveMode === "both") {
-                            let randomJunk2 = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                            let payloadTr2 = { junk: randomJunk2, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
-                            let pathStrTr2 = "/" + btoa(JSON.stringify(payloadTr2));
-                            let trojanExtBase2 = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${encodeURIComponent(pathStrTr2)}`;
-                            if (sysConfig.enableOpt2) trojanExtBase2 += `&pbk=enabled`;
-                            trojanExtBase2 += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
-                            lines.push(`${getBeta()}://${p.id}@${ip}:${port}?${trojanExtBase2}#${dtName}`);
+                            let configUuid = generateConfigUuid(p.id, configIndex);
+                            registerConfigEntry(configUuid, p.id, '');
+                            lines.push(`${getBeta()}://${configUuid}@${ip}:${port}?${extBase}#${dtName}`);
                         }
                     }
                     configIndex++;
@@ -4152,7 +3975,6 @@ async function buildUriProfile(hostName, targetSub = null, allowInsecure = false
 
 async function buildYamlProfile(hostName, targetSub = null, allowInsecure = false) {
     let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
-    let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
     let proxies = [];
     let proxyNames = [];
     let nameCounts = {}; // Track proxy names for deduplication
@@ -4222,10 +4044,12 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
                         let tName = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
                         tName = getUniqueName(tName);
                         proxyNames.push(`"${tName}"`);
-                        let randomJunkTr = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                        let payloadTr = { junk: randomJunkTr, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
+                        let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
+                        let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [] };
                         let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
-                        proxies.push(`- name: "${tName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: "${p.id}"\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrTr}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+                        let configUuid2 = generateConfigUuid(p.id, configIndex);
+                        registerConfigEntry(configUuid2, p.id, selectedProxyIp || '');
+                        proxies.push(`- name: "${tName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: ${configUuid2}\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrTr}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
                     }
                     configIndex++;
                     if (sysConfig.enableDirectConfigs && pips.length > 0) {
@@ -4244,12 +4068,11 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
                             let dtName = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, dcIndex, ipName));
                             proxyNames.push(`"${dtName}"`);
                             let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                            let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
+                            let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [] };
                             let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
-                            let randomJunkDt = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                            let payloadDt = { junk: randomJunkDt, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: dcIndex };
-                            let pathStrDt = "/" + btoa(JSON.stringify(payloadDt));
-                            proxies.push(`- name: "${dtName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: "${p.id}"\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrDt}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+                            let configUuid2 = generateConfigUuid(p.id, dcIndex);
+                            registerConfigEntry(configUuid2, p.id, '');
+                            proxies.push(`- name: "${dtName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: ${configUuid2}\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrTr}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
                         }
                         configIndex++;
                     }
@@ -4485,7 +4308,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
                         dynamicTags.push(tagStr);
 
                         let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                        let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
+                        let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [] };
                         let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
 
                         let configUuid2 = generateConfigUuid(p.id, configIndex);
@@ -4499,7 +4322,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
                             "ip-version": "ipv4-prefer",
                             "tfo": sysConfig.enableOpt1 || false,
                             "udp": true,
-                            "password": p.id,
+                            "password": configUuid2,
                             "packet-encoding": "xudp",
                             "tls": sec,
                             "sni": hName,
@@ -4542,11 +4365,11 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
                             let tagStr = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, configIndex, ipName));
                             dynamicTags.push(tagStr);
                             let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                            let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
+                            let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [] };
                             let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
                             let configUuid2 = generateConfigUuid(p.id, configIndex);
                             registerConfigEntry(configUuid2, p.id, '');
-                            let ob = { "name": tagStr, "type": k_tr_mode, "server": ip, "port": parseInt(port), "ip-version": "ipv4-prefer", "tfo": sysConfig.enableOpt1 || false, "udp": true, "password": p.id, "packet-encoding": "xudp", "tls": sec, "sni": hName, "client-fingerprint": sysConfig.agent || "random", "skip-cert-verify": allowInsecure, "alpn": ["http/1.1"], "network": "ws", "ws-opts": { "path": pathStrTr, "max-early-data": 2560, "early-data-header-name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
+                            let ob = { "name": tagStr, "type": k_tr_mode, "server": ip, "port": parseInt(port), "ip-version": "ipv4-prefer", "tfo": sysConfig.enableOpt1 || false, "udp": true, "password": configUuid2, "packet-encoding": "xudp", "tls": sec, "sni": hName, "client-fingerprint": sysConfig.agent || "random", "skip-cert-verify": allowInsecure, "alpn": ["http/1.1"], "network": "ws", "ws-opts": { "path": pathStrTr, "max-early-data": 2560, "early-data-header-name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
                             if (sysConfig.enableOpt2) ob["ech-opts"] = { "enable": true, "config": "AEX+DQBBTwAgACCfCTo0YCUiDF1bGU9Z72l8Bs1gVxt6D6FefjfzaJHcfwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=" };
                             proxiesArr.push(ob);
                         }
@@ -4805,7 +4628,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                         dynamicTags.push(tagStr);
 
                         let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                        let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
+                        let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [] };
                         let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
 
                         let configUuid2 = generateConfigUuid(p.id, configIndex);
@@ -4817,7 +4640,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                             "server": ip,
                             "server_port": parseInt(port),
                             "tcp_fast_open": sysConfig.enableOpt1 || false,
-                            "password": p.id,
+                            "password": configUuid2,
                             "network": "tcp",
                             "tls": {
                                 "enabled": sec,
@@ -4858,11 +4681,11 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                             let tagStr = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, configIndex, ipName));
                             dynamicTags.push(tagStr);
                             let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
-                            let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
+                            let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [] };
                             let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
                             let configUuid2 = generateConfigUuid(p.id, configIndex);
                             registerConfigEntry(configUuid2, p.id, '');
-                            let ob = { "type": k_tr_mode, "tag": tagStr, "server": ip, "server_port": parseInt(port), "tcp_fast_open": sysConfig.enableOpt1 || false, "password": p.id, "network": "tcp", "tls": { "enabled": sec, "server_name": hName, "insecure": allowInsecure, "alpn": ["http/1.1"], "utls": { "enabled": true, "fingerprint": "randomized" } }, "transport": { "type": "ws", "path": pathStrTr, "max_early_data": 2560, "early_data_header_name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
+                            let ob = { "type": k_tr_mode, "tag": tagStr, "server": ip, "server_port": parseInt(port), "tcp_fast_open": sysConfig.enableOpt1 || false, "password": configUuid2, "network": "tcp", "tls": { "enabled": sec, "server_name": hName, "insecure": allowInsecure, "alpn": ["http/1.1"], "utls": { "enabled": true, "fingerprint": "randomized" } }, "transport": { "type": "ws", "path": pathStrTr, "max_early_data": 2560, "early_data_header_name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
                             outboundsArr.push(ob);
                         }
                         configIndex++;
@@ -5087,15 +4910,7 @@ function getDashboardUI(hasDB) {
   <html lang="en" class="dark">
   <head>
       <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-      <meta name="apple-mobile-web-app-capable" content="yes">
-      <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-      <meta name="mobile-web-app-capable" content="yes">
-      <meta name="theme-color" content="#0d1117">
-      <meta name="apple-mobile-web-app-title" content="Nahan">
-      <meta name="format-detection" content="telephone=no">
-      <meta name="msapplication-tap-highlight" content="no">
-      <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%236366f1'/><text x='50' y='62' font-size='40' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'>N</text></svg>">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
       <title>Nahan Gateway</title>
       <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;900&display=swap" rel="stylesheet">
       <script src="https://cdn.tailwindcss.com"></script>
@@ -5140,10 +4955,6 @@ function getDashboardUI(hasDB) {
           .login-btn { transition: box-shadow 0.2s, transform 0.2s; }
           .login-btn:hover { box-shadow: 0 6px 32px rgba(99,102,241,0.6), inset 0 1px 0 rgba(255,255,255,0.1) !important; transform: translateY(-1px); }
           .login-btn:not(:hover) { box-shadow: 0 4px 24px rgba(99,102,241,0.4), inset 0 1px 0 rgba(255,255,255,0.1); transform: translateY(0); }
-          @media (max-width: 767px) {
-              .login-btn { transition: transform 0.12s ease, box-shadow 0.2s; }
-              .login-btn:active { transform: scale(0.96) !important; box-shadow: 0 2px 12px rgba(99,102,241,0.3) !important; }
-          }
           .icon-btn { transition: color 0.15s, border-color 0.15s; }
           .icon-btn:hover { color: #818cf8 !important; }
           .eye-btn { transition: color 0.15s; }
@@ -5175,11 +4986,6 @@ function getDashboardUI(hasDB) {
               background: #f8fafc !important;
               background-color: #f8fafc !important;
               color: #0f172a !important;
-          }
-          @media (max-width: 767px) {
-              html:not(.dark) header {
-                  background: rgba(248, 250, 252, 0.85) !important;
-              }
           }
           html:not(.dark) #login-box, html:not(.dark) #dash-box {
               background: #f8fafc !important;
@@ -5317,129 +5123,14 @@ function getDashboardUI(hasDB) {
           .nav-item:hover { background: rgba(255, 255, 255, 0.02) !important; }
           .mobile-nav-item.active { color: #818cf8; }
           .dark .mobile-nav-item.active { color: #818cf8; }
-
-          /* ===== NATIVE MOBILE APP STYLES ===== */
-
-          /* Disable text selection and tap highlights for app-like feel */
-          @media (max-width: 767px) {
-              *, *::before, *::after {
-                  -webkit-tap-highlight-color: transparent;
-              }
-              html {
-                  overscroll-behavior: none;
-                  -webkit-text-size-adjust: 100%;
-              }
-              body {
-                  overscroll-behavior: none;
-                  -webkit-overflow-scrolling: touch;
-                  touch-action: manipulation;
-              }
-          }
-
-          /* Native bottom tab bar */
-          @media (max-width: 767px) {
-              .mobile-bottom-nav {
-                  background: rgba(13, 17, 23, 0.85) !important;
-                  backdrop-filter: saturate(180%) blur(20px) !important;
-                  -webkit-backdrop-filter: saturate(180%) blur(20px) !important;
-                  border-top: 0.5px solid rgba(255, 255, 255, 0.08) !important;
-              }
-              html:not(.dark) .mobile-bottom-nav {
-                  background: rgba(255, 255, 255, 0.85) !important;
-                  backdrop-filter: saturate(180%) blur(20px) !important;
-                  -webkit-backdrop-filter: saturate(180%) blur(20px) !important;
-                  border-top: 0.5px solid rgba(0, 0, 0, 0.1) !important;
-              }
-          }
-
-          /* Native tab bar item */
-          @media (max-width: 767px) {
-              .mobile-tab-item {
-                  position: relative;
-                  transition: color 0.15s ease;
-                  padding: 4px 0;
-              }
-              .mobile-tab-item.active {
-                  color: #818cf8;
-              }
-              .mobile-tab-item.active::before {
-                  content: '';
-                  position: absolute;
-                  top: -1px;
-                  left: 50%;
-                  transform: translateX(-50%);
-                  width: 20px;
-                  height: 2px;
-                  background: #818cf8;
-                  border-radius: 1px;
-              }
-              .mobile-tab-item svg {
-                  width: 22px;
-                  height: 22px;
-                  transition: transform 0.15s ease;
-              }
-              .mobile-tab-item.active svg {
-                  transform: scale(1.08);
-              }
-              .mobile-tab-item span {
-                  font-size: 10px;
-                  font-weight: 600;
-                  letter-spacing: 0.01em;
-              }
-          }
-
-          /* Native save bar for mobile */
-          @media (max-width: 767px) {
-              .mobile-save-bar {
-                  background: rgba(13, 17, 23, 0.9) !important;
-                  backdrop-filter: saturate(180%) blur(20px) !important;
-                  -webkit-backdrop-filter: saturate(180%) blur(20px) !important;
-                  border-top: 0.5px solid rgba(255, 255, 255, 0.08) !important;
-                  padding-bottom: env(safe-area-inset-bottom, 0px) !important;
-              }
-              html:not(.dark) .mobile-save-bar {
-                  background: rgba(255, 255, 255, 0.92) !important;
-                  backdrop-filter: saturate(180%) blur(20px) !important;
-                  -webkit-backdrop-filter: saturate(180%) blur(20px) !important;
-                  border-top: 0.5px solid rgba(0, 0, 0, 0.08) !important;
-              }
-          }
-
-          /* Smooth momentum scrolling for scroll containers */
-          @media (max-width: 767px) {
-              .scroll-content {
-                  -webkit-overflow-scrolling: touch;
-                  scroll-behavior: smooth;
-                  overscroll-behavior-y: contain;
-              }
-              .native-press {
-                  transition: transform 0.12s ease, opacity 0.12s ease;
-              }
-              .native-press:active {
-                  transform: scale(0.96);
-                  opacity: 0.85;
-              }
-          }
-
-          /* Native status bar padding at very top */
-          @media (max-width: 767px) {
-              .dash-box-native {
-                  padding-top: env(safe-area-inset-top, 0px) !important;
-              }
-          }
-
-          /* Remove scrollbar on mobile for cleaner look */
-          @media (max-width: 767px) {
-              ::-webkit-scrollbar { width: 0; height: 0; }
-          }
       </style>
   </head>
   <body class="text-slate-800 dark:text-slate-200 h-[100dvh] flex flex-col md:flex-row overflow-hidden selection:bg-primary selection:text-white transition-colors duration-300 bg-slate-50 dark:bg-darkbg">
 
       <!-- Global Controls -->
       <div class="fixed top-4 end-4 md:top-5 md:end-5 flex items-center gap-2 z-50">
-          <span id="top-version-badge" class="hidden md:inline-block px-3 py-1.5 rounded-xl text-[11px] font-mono font-bold" style="background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.25);color:#818cf8;">v${CURRENT_VERSION}</span>
-          <a href="https://github.com/itsyebekhe/nahan" id="github-link-btn" target="_blank" class="hidden md:inline-flex btn-top-bar p-2 rounded-xl transition-all" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#94a3b8;">
+          <span id="top-version-badge" class="px-3 py-1.5 rounded-xl text-[11px] font-mono font-bold" style="background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.25);color:#818cf8;">v${CURRENT_VERSION}</span>
+          <a href="https://github.com/itsyebekhe/nahan" id="github-link-btn" target="_blank" class="btn-top-bar p-2 rounded-xl transition-all" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#94a3b8;">
               <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"></path></svg>
           </a>
           <button onclick="toggleLang()" id="lang-toggle" class="btn-top-bar px-3 py-1.5 rounded-xl text-sm font-bold transition-all" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#e2e8f0;">EN</button>
@@ -5504,7 +5195,7 @@ function getDashboardUI(hasDB) {
       </div>
 
       <!-- DASHBOARD CONTAINER -->
-      <div id="dash-box" class="hidden w-full h-full flex-col md:flex-row relative dash-box-native" style="padding-top: env(safe-area-inset-top, 0px);">
+      <div id="dash-box" class="hidden w-full h-full flex-col md:flex-row relative">
           
           <!-- SIDEBAR (Desktop) -->
           <aside class="hidden md:flex w-64 bg-white dark:bg-darkcard border-e border-slate-200 dark:border-darkborder flex-col z-20 shrink-0">
@@ -5555,8 +5246,8 @@ function getDashboardUI(hasDB) {
   
           <!-- MAIN CONTENT AREA -->
           <main class="flex-1 flex flex-col h-full overflow-hidden">
-              <header class="h-14 md:h-24 shrink-0 flex items-center px-4 md:px-10 z-10 pt-[env(safe-area-inset-top,0px)] md:pt-0" style="background:rgba(13,17,23,0.75);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);">
-                  <h2 id="view-title" class="text-lg md:text-3xl font-black text-slate-800 dark:text-white mt-0 md:mt-2">Overview</h2>
+              <header class="h-20 md:h-24 shrink-0 flex items-center px-6 md:px-10 z-10 pt-4 md:pt-0">
+                  <h2 id="view-title" class="text-2xl md:text-3xl font-black text-slate-800 dark:text-white mt-2">Overview</h2>
               </header>
   
               <!-- Scrollable Content -->
@@ -5619,35 +5310,35 @@ function getDashboardUI(hasDB) {
                       <div id="view-overview" class="space-y-3 md:space-y-6 block">
                           <!-- User Summary Cards -->
                           <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2 md:gap-4">
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
+                              <div class="bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
                                   <div class="flex items-center justify-between mb-1 md:mb-2">
                                       <span class="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-wider" data-i18n="ov_total_users">Total Users</span>
                                       <div class="p-1.5 md:p-2 bg-primary/10 text-primary rounded-md md:rounded-lg"><svg class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656-.126-1.283-.356-1.857M12 4.354a4 4 0 110 5.292"></path></svg></div>
                                   </div>
                                   <p id="ov-total-users" class="text-xl md:text-2xl font-black text-slate-800 dark:text-white">-</p>
                               </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
+                              <div class="bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
                                   <div class="flex items-center justify-between mb-1 md:mb-2">
                                       <span class="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-wider" data-i18n="ov_active_users">Active</span>
                                       <div class="p-1.5 md:p-2 bg-emerald-500/10 text-emerald-500 rounded-md md:rounded-lg"><svg class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg></div>
                                   </div>
                                   <p id="ov-active-users" class="text-xl md:text-2xl font-black text-emerald-600 dark:text-emerald-400">-</p>
                               </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
+                              <div class="bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
                                   <div class="flex items-center justify-between mb-1 md:mb-2">
                                       <span class="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-wider" data-i18n="ov_paused_users">Paused</span>
                                       <div class="p-1.5 md:p-2 bg-amber-500/10 text-amber-500 rounded-md md:rounded-lg"><svg class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg></div>
                                   </div>
                                   <p id="ov-paused-users" class="text-xl md:text-2xl font-black text-amber-600 dark:text-amber-400">-</p>
                               </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
+                              <div class="bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
                                   <div class="flex items-center justify-between mb-1 md:mb-2">
                                       <span class="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-wider" data-i18n="ov_auto_disabled">Auto-Disabled</span>
                                       <div class="p-1.5 md:p-2 bg-red-500/10 text-red-500 rounded-md md:rounded-lg"><svg class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg></div>
                                   </div>
                                   <p id="ov-auto-disabled" class="text-xl md:text-2xl font-black text-red-600 dark:text-red-400">-</p>
                               </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
+                              <div class="bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-4 shadow-sm border border-slate-200 dark:border-darkborder">
                                   <div class="flex items-center justify-between mb-1 md:mb-2">
                                       <span class="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-wider" data-i18n="ov_expired_users">Expired</span>
                                       <div class="p-1.5 md:p-2 bg-slate-500/10 text-slate-500 rounded-md md:rounded-lg"><svg class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg></div>
@@ -5658,33 +5349,33 @@ function getDashboardUI(hasDB) {
 
                           <!-- Traffic & System Cards -->
                           <div class="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-2 md:gap-4">
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
+                              <div class="bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
                                   <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3">
                                       <div class="p-1.5 md:p-2.5 bg-violet-500/10 text-violet-500 rounded-lg md:rounded-xl"><svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg></div>
-                                       <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_total_traffic">Total Traffic</span>
+                                      <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_total_traffic">Total Traffic</span>
                                   </div>
                                    <p id="ov-total-traffic" class="text-base md:text-xl font-black text-slate-800 dark:text-white">- GB</p>
                                   <p class="text-[9px] md:text-[10px] text-slate-400 mt-0.5 md:mt-1"><span id="ov-total-reqs">-</span> <span data-i18n="ov_requests">requests</span></p>
                               </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
+                              <div class="bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
                                   <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3">
                                       <div class="p-1.5 md:p-2.5 bg-cyan-500/10 text-cyan-500 rounded-lg md:rounded-xl"><svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg></div>
-                                       <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_today_traffic">Today's Traffic</span>
+                                      <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_today_traffic">Today's Traffic</span>
                                   </div>
                                   <p id="ov-today-traffic" class="text-base md:text-xl font-black text-slate-800 dark:text-white">- GB</p>
                                   <p class="text-[9px] md:text-[10px] text-slate-400 mt-0.5 md:mt-1"><span id="ov-today-reqs">-</span> <span data-i18n="ov_requests">requests</span></p>
                               </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
+                              <div class="bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
                                   <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3">
                                       <div class="p-1.5 md:p-2.5 bg-blue-500/10 text-blue-500 rounded-lg md:rounded-xl"><svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5.636 18.364a9 9 0 010-12.728m12.728 0a9 9 0 010 12.728m-9.9-2.829a5 5 0 010-7.07m7.072 0a5 5 0 010 7.07M13 12a1 1 0 11-2 0 1 1 0 012 0z"></path></svg></div>
-                                       <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_active_conns">Active Connections</span>
+                                      <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_active_conns">Active Connections</span>
                                   </div>
                                   <p id="ov-active-conns" class="text-base md:text-xl font-black text-slate-800 dark:text-white">-</p>
                               </div>
-                              <div class="native-press bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
+                              <div class="bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
                                   <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3">
                                       <div class="p-1.5 md:p-2.5 bg-indigo-500/10 text-indigo-500 rounded-lg md:rounded-xl"><svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg></div>
-                                       <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_system">System</span>
+                                      <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_system">System</span>
                                   </div>
                                   <p id="ov-version" class="text-base md:text-xl font-black text-slate-800 dark:text-white">-</p>
                               </div>
@@ -5706,21 +5397,21 @@ function getDashboardUI(hasDB) {
                               <div class="bg-white dark:bg-darkcard rounded-2xl md:rounded-3xl p-4 md:p-6 shadow-sm border border-slate-200 dark:border-darkborder">
                                   <h3 class="text-xs md:text-sm uppercase font-bold text-slate-500 tracking-wider mb-3 md:mb-4" data-i18n="ov_quick_actions">Quick Actions</h3>
                                   <div class="grid grid-cols-2 gap-2 md:grid-cols-1 md:gap-3">
-                                       <button onclick="openAddUserPage()" class="native-press flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-primary/10 hover:bg-primary/20 text-primary rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
-                                           <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
-                                           <span data-i18n="ov_add_user">Add User</span>
-                                       </button>
-                                       <button onclick="switchTab('users')" class="native-press flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-violet-500/10 hover:bg-violet-500/20 text-violet-600 dark:text-violet-400 rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
-                                           <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
-                                           <span data-i18n="ov_manage_users">Manage Users</span>
+                                      <button onclick="openAddUserModal()" class="flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-primary/10 hover:bg-primary/20 text-primary rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
+                                          <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
+                                          <span data-i18n="ov_add_user">Add User</span>
                                       </button>
-                                       <button onclick="exportConfig()" class="native-press flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
-                                           <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
-                                           <span data-i18n="ov_backup_config">Backup Config</span>
-                                       </button>
-                                       <button onclick="loadDashboard()" class="native-press flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-blue-500/10 hover:bg-blue-500/20 text-blue-600 dark:text-blue-400 rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
-                                           <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-                                           <span data-i18n="ov_refresh">Refresh Statistics</span>
+                                      <button onclick="switchTab('users')" class="flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-violet-500/10 hover:bg-violet-500/20 text-violet-600 dark:text-violet-400 rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
+                                          <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
+                                          <span data-i18n="ov_manage_users">Manage Users</span>
+                                      </button>
+                                      <button onclick="exportConfig()" class="flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
+                                          <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                                          <span data-i18n="ov_backup_config">Backup Config</span>
+                                      </button>
+                                      <button onclick="loadDashboard()" class="flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-blue-500/10 hover:bg-blue-500/20 text-blue-600 dark:text-blue-400 rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
+                                          <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                          <span data-i18n="ov_refresh">Refresh Statistics</span>
                                       </button>
                                   </div>
                               </div>
@@ -5973,31 +5664,10 @@ function getDashboardUI(hasDB) {
                                            </label>
                                        </div>
                                    </div>
-                                </div>
+                               </div>
 
-                                <!-- API Keys Management -->
-                                <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder md:col-span-2 space-y-4">
-                                    <div class="flex items-center justify-between">
-                                        <div>
-                                            <h3 class="text-sm font-bold text-slate-700 dark:text-slate-200 flex items-center gap-2">
-                                                🔑 <span data-i18n="lbl_api_keys">Panel API Keys</span>
-                                            </h3>
-                                            <p class="text-[10px] text-slate-500 dark:text-slate-400 mt-1" data-i18n="desc_api_keys">Generate API keys to securely connect remote panels. Remote panels use these keys instead of sharing your master key.</p>
-                                        </div>
-                                        <button onclick="generateApiKey()" class="px-4 py-2 bg-primary text-white text-xs font-bold rounded-xl hover:opacity-90 transition-opacity" data-i18n="btn_generate_key">Generate Key</button>
-                                    </div>
-                                    <div id="api-keys-list" class="space-y-2"></div>
-                                    <div id="api-key-new" class="hidden bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800 rounded-xl p-4 space-y-2">
-                                        <p class="text-xs font-bold text-emerald-700 dark:text-emerald-400" data-i18n="api_key_created">API Key Created! Copy it now — it won't be shown again.</p>
-                                        <div class="flex items-center gap-2">
-                                            <input type="text" id="api-key-value" readonly class="flex-1 px-3 py-2 bg-white dark:bg-slate-800 rounded-lg text-xs font-mono border border-emerald-300 dark:border-emerald-700 text-slate-700 dark:text-slate-300">
-                                            <button onclick="copyApiKey()" class="px-3 py-2 bg-emerald-600 text-white text-xs font-bold rounded-lg hover:bg-emerald-700">Copy</button>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <!-- Import/Export Config Area -->
-                               <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder md:col-span-2 space-y-4">
+                               <!-- Import/Export Config Area -->
+                              <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder md:col-span-2 space-y-4">
                                   <h3 class="text-sm uppercase font-bold text-slate-400 tracking-wider" data-i18n="backup_restore_title">Backup & Restore</h3>
                                   <div class="flex flex-col sm:flex-row gap-4">
                                       <button onclick="exportConfig()" class="flex-1 py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="export_btn">
@@ -6072,6 +5742,10 @@ function getDashboardUI(hasDB) {
                                       <div class="space-y-1">
                                           <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_relay">Proxy IPs (Comma/Newline separated)</label>
                                           <textarea id="cfg-relay" rows="3" placeholder="104.20.0.1&#10;proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
+                                      </div>
+                                      <div class="space-y-1">
+                                          <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_fake">Maintenance Hosts (Camouflage)</label>
+                                          <input type="text" id="cfg-fake" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                                       </div>
                                       <div class="space-y-1">
                                           <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_nat64">NAT64 Prefix</label>
@@ -6164,48 +5838,32 @@ function getDashboardUI(hasDB) {
 
                           <!-- Section: Cluster -->
                           <div class="bg-indigo-50 dark:bg-indigo-950/20 rounded-2xl border border-indigo-100 dark:border-indigo-900/50 overflow-hidden" data-accordion>
-                               <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-indigo-100/50 dark:hover:bg-indigo-900/30 transition-colors">
-                                   <div class="flex items-center gap-3">
-                                       <span class="text-lg">🔬</span>
-                                       <span class="text-sm font-bold text-indigo-700 dark:text-indigo-300" data-i18n="other_nodes_title">Other Nodes</span>
-                                   </div>
-                                   <svg class="w-4 h-4 text-indigo-400 transform transition-transform duration-200 accordion-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
-                               </button>
-                               <div data-accordion-content class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
-                                   <div class="space-y-3 px-5 pb-5 pt-1">
-                                       <p class="text-xs text-indigo-600/80 dark:text-indigo-300/70 leading-relaxed" data-i18n="other_nodes_desc">External nodes (URL + API Key) for cross-panel management.</p>
-                                       <div class="flex items-center justify-between">
-                                           <div id="linked-nodes-list" class="space-y-2 flex-1"></div>
-                                       </div>
-                                       <button onclick="showAddNodeModal()" type="button" class="w-full py-3 border-2 border-dashed border-indigo-300 dark:border-indigo-700 hover:border-indigo-500 dark:hover:border-indigo-500 text-indigo-500 dark:text-indigo-400 text-sm font-bold rounded-xl transition-colors flex items-center justify-center gap-2">
-                                           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
-                                           <span data-i18n="add_node_confirm">Add Node</span>
-                                       </button>
-                                   </div>
-                               </div>
-                           </div>
-
-                          <!-- Modal: Add Other Node -->
-                           <div id="modal-add-node" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 pb-4 sm:p-4 bg-slate-900/50 backdrop-blur-sm">
-                               <div class="bg-white dark:bg-darkcard rounded-t-3xl sm:rounded-3xl w-full sm:max-w-md max-h-[calc(100vh-2rem)] sm:max-h-[85vh] flex flex-col shadow-2xl border border-slate-200 dark:border-darkborder">
-                                  <div class="px-6 pt-6 pb-4">
-                                      <h3 class="text-lg font-bold" data-i18n="add_node_title">Add External Node</h3>
-                                      <p class="text-xs text-slate-400 mt-1" data-i18n="add_node_desc">Enter the URL and API Key of the external panel.</p>
+                              <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-indigo-100/50 dark:hover:bg-indigo-900/30 transition-colors">
+                                  <div class="flex items-center gap-3">
+                                      <span class="text-lg">🔬</span>
+                                      <span class="text-sm font-bold text-indigo-700 dark:text-indigo-300" data-i18n="slave_title">Slave Worker Nodes</span>
                                   </div>
-                                   <div class="px-6 pb-4 space-y-4 overflow-y-auto flex-1 min-h-0">
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="add_node_url">Node URL</label>
-                                          <input type="text" id="add-node-url" placeholder="node.example.com" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
+                                  <svg class="w-4 h-4 text-indigo-400 transform transition-transform duration-200 accordion-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div data-accordion-content class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
+                                  <div class="space-y-3 px-5 pb-5 pt-1">
+                                      <p class="text-xs text-indigo-600/80 dark:text-indigo-300/70 leading-relaxed" data-i18n="slave_desc">Enter your other worker Domains (one per line). Master will push settings and users to them automatically, and include them in load-balanced subscriptions!</p>
+                                      <div class="relative">
+                                          <textarea id="cfg-nodes" rows="3" placeholder="node1.worker.dev&#10;node2.domain.com" class="w-full px-4 py-3 pb-12 rounded-xl border border-indigo-200 dark:border-indigo-800/50 bg-white dark:bg-slate-900 focus:border-indigo-500 focus:ring-1 outline-none font-mono text-sm resize-none text-slate-700 dark:text-slate-300 placeholder:text-indigo-300 dark:placeholder:text-indigo-800/50"></textarea>
+                                          <div class="absolute bottom-3 end-3">
+                                              <button onclick="forceSyncNodes()" type="button" class="px-3 py-1.5 bg-indigo-500 hover:bg-indigo-600 text-white text-xs font-bold rounded-lg transition-colors flex items-center shadow-sm">
+                                                  <svg id="sync-icon" class="w-3.5 h-3.5 me-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                                  <span id="sync-btn-txt" data-i18n="force_sync">Force Sync Now</span>
+                                              </button>
+                                          </div>
                                       </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="add_node_apikey">API Key</label>
-                                          <input type="password" id="add-node-apikey" placeholder="nahan_..." class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono pe-12">
-                                          <button type="button" onclick="const n=document.getElementById('add-node-apikey');n.type=n.type==='password'?'text':'password'" class="absolute end-14 mt-[-36px] px-2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
-                                      </div>
-                                  </div>
-                                  <div class="px-6 py-4 border-t border-slate-200 dark:border-darkborder flex justify-end gap-2">
-                                      <button onclick="document.getElementById('modal-add-node').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold text-sm" data-i18n="btn_cancel">Cancel</button>
-                                      <button onclick="commitAddNode()" class="px-4 py-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 text-white font-bold text-sm" data-i18n="add_node_confirm">Add Node</button>
+                                      <label class="flex items-center justify-between cursor-pointer bg-white dark:bg-slate-800/50 p-3 rounded-2xl">
+                                          <span class="text-sm font-bold text-slate-700 dark:text-slate-300" data-i18n="lbl_allow_sync">Allow Sync</span>
+                                          <div class="relative inline-flex items-center cursor-pointer">
+                                              <input type="checkbox" id="cfg-allow-sync" class="sr-only peer">
+                                              <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
+                                          </div>
+                                      </label>
                                   </div>
                               </div>
                           </div>
@@ -6340,243 +5998,252 @@ function getDashboardUI(hasDB) {
                               </div>
                           </div>
 
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-4 md:p-6 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden">
-                              <div class="flex flex-col sm:flex-row items-stretch sm:items-center justify-between mb-4 md:mb-6 gap-3">
-                                   <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider" data-i18n="sub_directory_title">Subscriber Directory</h3>
-                                   <div class="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-                                       <select id="user-status-filter" onchange="renderUsersTable()" class="bg-slate-50 dark:bg-darkbg border border-slate-200 dark:border-darkborder px-3 py-2.5 rounded-xl text-xs outline-none font-sans text-slate-600 dark:text-slate-400 focus:border-primary">
-                                           <option value="all" data-i18n="filter_all">All Users</option>
-                                           <option value="active" data-i18n="filter_active">Active</option>
-                                           <option value="paused" data-i18n="filter_paused">Paused</option>
-                                           <option value="auto-disabled" data-i18n="filter_auto_disabled">Auto-Disabled</option>
-                                       </select>
-                                       <input type="text" id="user-search-input" onkeyup="renderUsersTable()" placeholder="🔍 Find by Name or UUID..." data-i18n="user_search_placeholder" class="bg-slate-50 dark:bg-darkbg border border-slate-200 dark:border-darkborder px-3 py-2.5 rounded-xl text-xs outline-none font-sans text-slate-600 dark:text-slate-400 focus:border-primary">
-                                       <button onclick="openAddUserPage()" class="native-press px-4 py-2.5 bg-primary hover:bg-primary/90 text-white rounded-xl text-xs font-bold transition-colors shadow-sm whitespace-nowrap" data-i18n="btn_add_user">+ Add New User</button>
-                                   </div>
-                               </div>
+                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden">
+                              <div class="flex flex-col sm:flex-row items-stretch sm:items-center justify-between mb-6 gap-4">
+                                  <div>
+                                       <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider" data-i18n="sub_directory_title">Subscriber Directory</h3>
+                                       <p class="text-xs text-slate-400 mt-1" data-i18n="sub_directory_desc">Search, modify bounds, toggle traffic limits or clear billing sessions.</p>
+                                  </div>
+                                  <div class="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+                                      <select id="user-status-filter" onchange="renderUsersTable()" class="bg-slate-50 dark:bg-darkbg border border-slate-200 dark:border-darkborder px-4 py-2.5 rounded-xl text-xs outline-none font-sans text-slate-600 dark:text-slate-400 focus:border-primary">
+                                          <option value="all" data-i18n="filter_all">All Users</option>
+                                          <option value="active" data-i18n="filter_active">Active</option>
+                                          <option value="paused" data-i18n="filter_paused">Paused</option>
+                                          <option value="auto-disabled" data-i18n="filter_auto_disabled">Auto-Disabled</option>
+                                      </select>
+                                      <input type="text" id="user-search-input" onkeyup="renderUsersTable()" placeholder="🔍 Find by Name or UUID..." data-i18n="user_search_placeholder" class="bg-slate-50 dark:bg-darkbg border border-slate-200 dark:border-darkborder px-4 py-2.5 rounded-xl text-xs outline-none font-sans text-slate-600 dark:text-slate-400 focus:border-primary">
+                                      <button onclick="openAddUserModal()" class="px-4 py-2.5 bg-primary hover:bg-primary/90 text-white rounded-xl text-xs font-bold transition-colors shadow-sm" data-i18n="btn_add_user">+ Add New User</button>
+                                  </div>
+                              </div>
                               <div class="overflow-x-auto">
                                   <div id="tbl-users" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
                                   </div>
                               </div>
                           </div>
-                       </div>
+                      </div>
 
-                       <!-- PAGE: Add User -->
-                       <div id="view-add-user" class="hidden h-full flex flex-col">
-                           <div class="bg-white dark:bg-darkcard rounded-2xl md:rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden flex flex-col flex-1 min-h-0">
-                               <div class="flex items-center gap-3 px-5 py-4 border-b border-slate-200 dark:border-darkborder shrink-0">
-                                   <button onclick="closeAddUserPage()" class="native-press p-2 -ms-2 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors">
-                                       <svg class="w-5 h-5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path></svg>
-                                   </button>
-                                   <h3 class="text-lg font-bold text-slate-800 dark:text-white" data-i18n="modal_add_title">Add User</h3>
-                               </div>
-                               <div class="overflow-y-auto flex-1 min-h-0 p-5 space-y-5">
-                                   <div class="space-y-4">
-                                       <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" data-i18n="section_basic_info">Basic Info</h4>
-                                       <div class="space-y-3">
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_u_name">Name / Identifier</label>
-                                               <input type="text" id="add-user-name" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_custom_config_name">Custom Config Name / Prefix</label>
-                                               <input type="text" id="add-user-custom-name" placeholder="Leave empty to use user name" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                           </div>
-                                       </div>
-                                   </div>
-                                   <div class="space-y-4">
-                                       <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" data-i18n="section_limits">Limits</h4>
-                                       <div class="space-y-3">
-                                           <div class="grid grid-cols-2 gap-3">
-                                               <div>
-                                                   <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_traffic_limit_gb">Traffic (GB) Limit</label>
-                                                   <input type="number" id="add-user-total-reqs" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                               </div>
-                                               <div>
-                                                   <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_daily_limit_gb">Daily Limit (GB)</label>
-                                                   <input type="number" id="add-user-daily-reqs" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                               </div>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_expiration_days">Expiration (Days)</label>
-                                               <input type="number" id="add-user-days" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_conn_limit">IP Connection Limit</label>
-                                               <input type="number" id="add-user-conn-limit" placeholder="Unlimited" min="1" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm" data-i18n-placeholder="unlimited">
-                                               <p class="text-[10px] text-slate-400 mt-1" data-i18n="desc_conn_limit">Max simultaneous connections per IP. Leave empty for unlimited.</p>
-                                           </div>
-                                       </div>
-                                   </div>
-                                   <div class="space-y-4">
-                                       <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" data-i18n="section_network">Network</h4>
-                                       <div class="space-y-3">
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_clean_ips">Clean IPs</label>
-                                               <div id="add-user-clean-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
-                                               <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_clean_ips_modal">Custom Clean IPs (comma/newline)</label>
-                                               <textarea id="add-user-custom-clean" rows="2" placeholder="e.g. 1.2.3.4, 5.6.7.8" class="w-full mt-1 px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_proxy_ips">Proxy IPs</label>
-                                               <div id="add-user-proxy-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
-                                               <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_proxy_ips">Custom Proxy IPs (comma/newline)</label>
-                                               <textarea id="add-user-custom-proxy" rows="2" placeholder="e.g. proxy1.com:443" class="w-full mt-1 px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_assigned_nodes">Assigned Nodes</label>
-                                               <div id="add-user-nodes-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
-                                               <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_assigned_nodes">Custom Nodes (comma/newline, empty = all nodes)</label>
-                                               <textarea id="add-user-custom-nodes" rows="2" placeholder="node1.example.com" class="w-full mt-1 px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_user_panel_url">Main Panel URL (Custom Nodes)</label>
-                                               <input type="text" id="add-user-panel-url" placeholder="e.g. panel.example.com" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                               <p class="text-[10px] text-slate-400 mt-1" data-i18n="desc_user_panel_url">Main panel domain for custom nodes. If empty, default panel URL is used.</p>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_nat64">NAT64 Prefix</label>
-                                               <input type="text" id="add-user-nat64" placeholder="e.g. 64:ff9b::/96" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
-                                               <p class="text-[10px] text-slate-400 mt-1" data-i18n="desc_nat64_user">Optional. Converts IPv4 Proxy IPs to NAT64 IPv6 addresses.</p>
-                                           </div>
-                                       </div>
-                                   </div>
-                                   <div class="space-y-4">
-                                       <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" data-i18n="section_advanced">Advanced</h4>
-                                       <div class="space-y-3">
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_protocol_mode">Protocol Mode</label>
-                                               <div id="add-user-mode-wrap" class="flex gap-4 mt-1">
-                                                   <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="add-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
-                                                   <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" value="beta" class="add-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
-                                               </div>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5">Ports</label>
-                                               <div id="add-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_max_configs">Max Configs</label>
-                                               <input type="number" id="add-user-max-configs" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm" data-i18n-placeholder="unlimited">
-                                           </div>
-                                       </div>
-                                   </div>
-                               </div>
-                               <div class="px-5 py-4 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard flex justify-between items-center shrink-0">
-                                   <button onclick="closeAddUserPage()" class="px-5 py-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold text-sm" data-i18n="btn_cancel">Cancel</button>
-                                   <button onclick="commitAddUser()" class="native-press px-6 py-2.5 rounded-xl bg-primary text-white font-bold text-sm shadow-sm" data-i18n="save_btn_user">Save User</button>
-                               </div>
-                           </div>
-                       </div>
+                      <!-- Modal: Add User -->
+                      <div id="modal-add-user" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-900/50 backdrop-blur-sm">
+                          <div class="bg-white dark:bg-darkcard rounded-t-3xl sm:rounded-3xl w-full sm:max-w-md max-h-[90vh] sm:max-h-[85vh] flex flex-col shadow-2xl border border-slate-200 dark:border-darkborder">
+                              <div class="px-6 pt-6 pb-4 shrink-0">
+                                  <h3 class="text-xl font-bold" data-i18n="modal_add_title">Add User</h3>
+                              </div>
+                              <div class="overflow-y-auto flex-1 min-h-0 px-6 pb-4">
+                                  <div class="space-y-3">
+                                      <details open class="group">
+                                          <summary class="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 select-none list-none">
+                                              <svg class="w-3 h-3 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                                              <span data-i18n="section_basic_info">Basic Info</span>
+                                          </summary>
+                                          <div class="space-y-3 ps-5">
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_name">Name / Identifier</label>
+                                                  <input type="text" id="add-user-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_custom_config_name">Custom Config Name / Prefix</label>
+                                                  <input type="text" id="add-user-custom-name" placeholder="Leave empty to use user name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                              </div>
+                                          </div>
+                                      </details>
+                                      <details open class="group">
+                                          <summary class="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 select-none list-none">
+                                              <svg class="w-3 h-3 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                                              <span data-i18n="section_limits">Limits</span>
+                                          </summary>
+                                          <div class="space-y-3 ps-5">
+                                              <div class="grid grid-cols-2 gap-3">
+                                                  <div>
+                                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_traffic_limit_gb">Traffic (GB) Limit</label>
+                                                      <input type="number" id="add-user-total-reqs" placeholder="Unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                                  </div>
+                                                  <div>
+                                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_daily_limit_gb">Daily Limit (GB)</label>
+                                                      <input type="number" id="add-user-daily-reqs" placeholder="Unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                                  </div>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_expiration_days">Expiration (Days)</label>
+                                                  <input type="number" id="add-user-days" placeholder="Unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                              </div>
+                                          </div>
+                                      </details>
+                                      <details class="group">
+                                          <summary class="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 select-none list-none">
+                                              <svg class="w-3 h-3 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                                              <span data-i18n="section_network">Network</span>
+                                          </summary>
+                                          <div class="space-y-3 ps-5">
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_clean_ips">Clean IPs</label>
+                                                  <div id="add-user-clean-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+                                                  <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_clean_ips_modal">Custom Clean IPs (comma/newline)</label>
+                                                  <textarea id="add-user-custom-clean" rows="1" placeholder="e.g. 1.2.3.4, 5.6.7.8" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_proxy_ips">Proxy IPs</label>
+                                                  <div id="add-user-proxy-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+                                                  <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_proxy_ips">Custom Proxy IPs (comma/newline)</label>
+                                                  <textarea id="add-user-custom-proxy" rows="1" placeholder="e.g. proxy1.com:443" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_assigned_nodes">Assigned Nodes</label>
+                                                  <div id="add-user-nodes-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+                                                  <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_assigned_nodes">Custom Nodes (comma/newline, empty = all nodes)</label>
+                                                  <textarea id="add-user-custom-nodes" rows="1" placeholder="node1.example.com" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_nat64">NAT64 Prefix</label>
+                                                  <input type="text" id="add-user-nat64" placeholder="e.g. 64:ff9b::/96" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
+                                                  <p class="text-[10px] text-slate-400 mt-1" data-i18n="desc_nat64_user">Optional. Converts IPv4 Proxy IPs to NAT64 IPv6 addresses.</p>
+                                              </div>
+                                          </div>
+                                      </details>
+                                      <details class="group">
+                                          <summary class="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 select-none list-none">
+                                              <svg class="w-3 h-3 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                                              <span data-i18n="section_advanced">Advanced</span>
+                                          </summary>
+                                          <div class="space-y-3 ps-5">
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_protocol_mode">Protocol Mode</label>
+                                                  <div id="add-user-mode-wrap" class="flex gap-3 mt-1">
+                                                      <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="add-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
+                                                      <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="beta" class="add-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
+                                                  </div>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1">Ports</label>
+                                                  <div id="add-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_max_configs">Max Configs</label>
+                                                  <input type="number" id="add-user-max-configs" placeholder="Unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm" data-i18n-placeholder="unlimited">
+                                              </div>
+                                          </div>
+                                      </details>
+                                  </div>
+                              </div>
+                              <div class="px-6 py-4 shrink-0 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard sm:rounded-b-3xl pb-[env(safe-area-inset-bottom)]">
+                                  <div class="flex justify-end gap-2">
+                                      <button onclick="document.getElementById('modal-add-user').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold" data-i18n="btn_cancel">Cancel</button>
+                                      <button onclick="commitAddUser()" class="px-4 py-2 rounded-xl bg-primary text-white font-bold" data-i18n="save_btn_user">Save User</button>
+                                  </div>
+                              </div>
+                          </div>
+                      </div>
 
-                       <!-- PAGE: Edit User -->
-                       <div id="view-edit-user" class="hidden h-full flex flex-col">
-                           <div class="bg-white dark:bg-darkcard rounded-2xl md:rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden flex flex-col flex-1 min-h-0">
-                               <div class="flex items-center gap-3 px-5 py-4 border-b border-slate-200 dark:border-darkborder shrink-0">
-                                   <button onclick="closeEditUserPage()" class="native-press p-2 -ms-2 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors">
-                                       <svg class="w-5 h-5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path></svg>
-                                   </button>
-                                   <h3 class="text-lg font-bold text-slate-800 dark:text-white" data-i18n="edit_sub">Edit Subscriber</h3>
-                                   <input type="hidden" id="edit-user-id">
-                               </div>
-                               <div class="overflow-y-auto flex-1 min-h-0 p-5 space-y-5">
-                                   <div class="space-y-4">
-                                       <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" data-i18n="section_basic_info">Basic Info</h4>
-                                       <div class="space-y-3">
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_name_ph">Name / Identifier</label>
-                                               <input type="text" id="edit-user-name" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_custom_config_name">Custom Config Name / Prefix</label>
-                                               <input type="text" id="edit-user-custom-name" placeholder="Leave empty to use user name" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                           </div>
-                                       </div>
-                                   </div>
-                                   <div class="space-y-4">
-                                       <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" data-i18n="section_limits">Limits</h4>
-                                       <div class="space-y-3">
-                                           <div class="grid grid-cols-2 gap-3">
-                                               <div>
-                                                   <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_traffic_limit_gb">Traffic Limit (GB)</label>
-                                                   <input type="number" id="edit-user-total-reqs" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                               </div>
-                                               <div>
-                                                   <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_daily_limit_gb">Daily Limit (GB)</label>
-                                                   <input type="number" id="edit-user-daily-reqs" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                               </div>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_expiration_days">Expiration (Days)</label>
-                                               <input type="number" id="edit-user-days" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_conn_limit">IP Connection Limit</label>
-                                               <input type="number" id="edit-user-conn-limit" placeholder="Unlimited" min="1" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm" data-i18n-placeholder="unlimited">
-                                               <p class="text-[10px] text-slate-400 mt-1" data-i18n="desc_conn_limit">Max simultaneous connections per user. Leave empty for unlimited.</p>
-                                           </div>
-                                       </div>
-                                   </div>
-                                   <div class="space-y-4">
-                                       <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" data-i18n="section_network">Network</h4>
-                                       <div class="space-y-3">
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_clean_ips">Clean IPs</label>
-                                               <div id="edit-user-clean-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
-                                               <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_clean_ips_modal">Custom Clean IPs (comma/newline)</label>
-                                               <textarea id="edit-user-custom-clean" rows="2" placeholder="e.g. 1.2.3.4, 5.6.7.8" class="w-full mt-1 px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_proxy_ips">Proxy IPs</label>
-                                               <div id="edit-user-proxy-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
-                                               <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_proxy_ips">Custom Proxy IPs (comma/newline)</label>
-                                               <textarea id="edit-user-custom-proxy" rows="2" placeholder="e.g. proxy1.com:443" class="w-full mt-1 px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_assigned_nodes">Assigned Nodes</label>
-                                               <div id="edit-user-nodes-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
-                                               <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_assigned_nodes">Custom Nodes (comma/newline, empty = all nodes)</label>
-                                               <textarea id="edit-user-custom-nodes" rows="2" placeholder="node1.example.com" class="w-full mt-1 px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_user_panel_url">Main Panel URL (Custom Nodes)</label>
-                                               <input type="text" id="edit-user-panel-url" placeholder="e.g. panel.example.com" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                               <p class="text-[10px] text-slate-400 mt-1" data-i18n="desc_user_panel_url">Main panel domain for custom nodes. If empty, default panel URL is used.</p>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_nat64">NAT64 Prefix</label>
-                                               <input type="text" id="edit-user-nat64" placeholder="e.g. 64:ff9b::/96" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
-                                               <p class="text-[10px] text-slate-400 mt-1" data-i18n="desc_nat64_user">Optional. Converts IPv4 Proxy IPs to NAT64 IPv6 addresses.</p>
-                                           </div>
-                                       </div>
-                                   </div>
-                                   <div class="space-y-4">
-                                       <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" data-i18n="section_advanced">Advanced</h4>
-                                       <div class="space-y-3">
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_protocol_mode">Protocol Mode</label>
-                                               <div id="edit-user-mode-wrap" class="flex gap-4 mt-1">
-                                                   <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="edit-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
-                                                   <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" value="beta" class="edit-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
-                                               </div>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5">Ports</label>
-                                               <div id="edit-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
-                                           </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_max_configs">Max Configs</label>
-                                               <input type="number" id="edit-user-max-configs" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm" data-i18n-placeholder="unlimited">
-                                           </div>
-                                       </div>
-                                   </div>
-                               </div>
-                               <div class="px-5 py-4 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard flex justify-between items-center shrink-0">
-                                   <button onclick="closeEditUserPage()" class="px-5 py-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold text-sm" data-i18n="btn_cancel">Cancel</button>
-                                   <button onclick="commitEditUser()" class="native-press px-6 py-2.5 rounded-xl bg-primary text-white font-bold text-sm shadow-sm" data-i18n="btn_save_changes">Save Changes</button>
-                               </div>
-                           </div>
-                       </div>
+                      <!-- Modal: Edit User -->
+                      <div id="modal-edit-user" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-900/50 backdrop-blur-sm">
+                          <div class="bg-white dark:bg-darkcard rounded-t-3xl sm:rounded-3xl w-full sm:max-w-md max-h-[90vh] sm:max-h-[85vh] flex flex-col shadow-2xl border border-slate-200 dark:border-darkborder">
+                              <div class="px-6 pt-6 pb-4 shrink-0">
+                                  <h3 class="text-xl font-bold" data-i18n="edit_sub">Edit Subscriber</h3>
+                                  <input type="hidden" id="edit-user-id">
+                              </div>
+                              <div class="overflow-y-auto flex-1 min-h-0 px-6 pb-4">
+                                  <div class="space-y-3">
+                                      <details open class="group">
+                                          <summary class="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 select-none list-none">
+                                              <svg class="w-3 h-3 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                                              <span data-i18n="section_basic_info">Basic Info</span>
+                                          </summary>
+                                          <div class="space-y-3 ps-5">
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_name_ph">Name / Identifier</label>
+                                                  <input type="text" id="edit-user-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_custom_config_name">Custom Config Name / Prefix</label>
+                                                  <input type="text" id="edit-user-custom-name" placeholder="Leave empty to use user name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                              </div>
+                                          </div>
+                                      </details>
+                                      <details open class="group">
+                                          <summary class="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 select-none list-none">
+                                              <svg class="w-3 h-3 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                                              <span data-i18n="section_limits">Limits</span>
+                                          </summary>
+                                          <div class="space-y-3 ps-5">
+                                              <div class="grid grid-cols-2 gap-3">
+                                                  <div>
+                                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_traffic_limit_gb">Traffic Limit (GB)</label>
+                                                      <input type="number" id="edit-user-total-reqs" placeholder="Unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                                  </div>
+                                                  <div>
+                                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_daily_limit_gb">Daily Limit (GB)</label>
+                                                      <input type="number" id="edit-user-daily-reqs" placeholder="Unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                                  </div>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_expiration_days">Expiration (Days)</label>
+                                                  <input type="number" id="edit-user-days" placeholder="Unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                              </div>
+                                          </div>
+                                      </details>
+                                      <details class="group">
+                                          <summary class="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 select-none list-none">
+                                              <svg class="w-3 h-3 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                                              <span data-i18n="section_network">Network</span>
+                                          </summary>
+                                          <div class="space-y-3 ps-5">
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_clean_ips">Clean IPs</label>
+                                                  <div id="edit-user-clean-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+                                                  <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_clean_ips_modal">Custom Clean IPs (comma/newline)</label>
+                                                  <textarea id="edit-user-custom-clean" rows="1" placeholder="e.g. 1.2.3.4, 5.6.7.8" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_proxy_ips">Proxy IPs</label>
+                                                  <div id="edit-user-proxy-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+                                                  <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_proxy_ips">Custom Proxy IPs (comma/newline)</label>
+                                                  <textarea id="edit-user-custom-proxy" rows="1" placeholder="e.g. proxy1.com:443" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_assigned_nodes">Assigned Nodes</label>
+                                                  <div id="edit-user-nodes-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+                                                  <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_assigned_nodes">Custom Nodes (comma/newline, empty = all nodes)</label>
+                                                  <textarea id="edit-user-custom-nodes" rows="1" placeholder="node1.example.com" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_nat64">NAT64 Prefix</label>
+                                                  <input type="text" id="edit-user-nat64" placeholder="e.g. 64:ff9b::/96" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
+                                                  <p class="text-[10px] text-slate-400 mt-1" data-i18n="desc_nat64_user">Optional. Converts IPv4 Proxy IPs to NAT64 IPv6 addresses.</p>
+                                              </div>
+                                          </div>
+                                      </details>
+                                      <details class="group">
+                                          <summary class="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 select-none list-none">
+                                              <svg class="w-3 h-3 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                                              <span data-i18n="section_advanced">Advanced</span>
+                                          </summary>
+                                          <div class="space-y-3 ps-5">
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_protocol_mode">Protocol Mode</label>
+                                                  <div id="edit-user-mode-wrap" class="flex gap-3 mt-1">
+                                                      <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="edit-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
+                                                      <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="beta" class="edit-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
+                                                  </div>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1">Ports</label>
+                                                  <div id="edit-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_max_configs">Max Configs</label>
+                                                  <input type="number" id="edit-user-max-configs" placeholder="Unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm" data-i18n-placeholder="unlimited">
+                                              </div>
+                                          </div>
+                                      </details>
+                                  </div>
+                              </div>
+                              <div class="px-6 py-4 shrink-0 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard sm:rounded-b-3xl pb-[env(safe-area-inset-bottom)]">
+                                  <div class="flex justify-end gap-2">
+                                      <button onclick="document.getElementById('modal-edit-user').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold" data-i18n="btn_cancel">Cancel</button>
+                                      <button onclick="commitEditUser()" class="px-4 py-2 rounded-xl bg-primary text-white font-bold" data-i18n="btn_save_changes">Save Changes</button>
+                                  </div>
+                              </div>
+                          </div>
+                      </div>
 
                       <!-- LOGS VIEW -->
                       <div id="view-logs" class="hidden space-y-6">
@@ -6596,39 +6263,39 @@ function getDashboardUI(hasDB) {
               </div>
   
               <!-- Save Bar (Docked to bottom of main content) -->
-              <div class="shrink-0 bg-white dark:bg-darkcard border-t border-slate-200 dark:border-darkborder p-4 flex justify-between md:justify-end items-center z-20 mobile-save-bar">
+              <div class="shrink-0 bg-white dark:bg-darkcard border-t border-slate-200 dark:border-darkborder p-4 flex justify-between md:justify-end items-center z-20">
                   <span id="save-status" class="text-sm font-bold text-slate-500 md:me-4"></span>
-                  <button onclick="doSave()" class="native-press px-8 py-3 bg-primary text-white font-bold rounded-xl shadow-lg hover:opacity-90 transition-opacity" data-i18n="save_btn">Save Config</button>
+                  <button onclick="doSave()" class="px-8 py-3 bg-primary text-white font-bold rounded-xl shadow-lg hover:opacity-90 transition-opacity" data-i18n="save_btn">Save Config</button>
               </div>
           </main>
   
           <!-- BOTTOM NAV (Mobile) -->
-          <nav class="md:hidden w-full mobile-bottom-nav flex justify-around items-center z-30 shrink-0" style="height:calc(4rem + env(safe-area-inset-bottom, 0px));padding-bottom:env(safe-area-inset-bottom, 0px);">
-              <button onclick="switchTab('overview')" id="mob-tab-overview" class="mobile-tab-item mobile-nav-item active flex flex-col items-center justify-center w-full h-full text-slate-400">
+          <nav class="md:hidden w-full h-16 bg-white dark:bg-darkcard border-t border-slate-200 dark:border-darkborder flex justify-around items-center z-30 shrink-0 pb-safe">
+              <button onclick="switchTab('overview')" id="mob-tab-overview" class="mobile-nav-item active flex flex-col items-center justify-center w-full h-full text-slate-400">
                   <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1V5zm10 0a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1V5zM4 15a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1v-4zm10 0a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"></path></svg>
                   <span class="text-[10px] font-bold" data-i18n="tab_overview">Home</span>
               </button>
-              <button onclick="switchTab('info')" id="mob-tab-info" class="mobile-tab-item mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
+              <button onclick="switchTab('info')" id="mob-tab-info" class="mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
                   <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>
                   <span class="text-[10px] font-bold" data-i18n="tab_info">Endpoints</span>
               </button>
-              <button onclick="switchTab('network')" id="mob-tab-network" class="mobile-tab-item mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
-                  <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
+              <button onclick="switchTab('network')" id="mob-tab-network" class="mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
+                  <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012-2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
                   <span class="text-[10px] font-bold" data-i18n="tab_status">Metrics</span>
               </button>
-              <button onclick="switchTab('settings')" id="mob-tab-settings" class="mobile-tab-item mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
+              <button onclick="switchTab('settings')" id="mob-tab-settings" class="mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
                   <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path></svg>
                   <span class="text-[10px] font-bold" data-i18n="tab_settings">System</span>
               </button>
-              <button onclick="switchTab('advanced')" id="mob-tab-advanced" class="mobile-tab-item mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
+              <button onclick="switchTab('advanced')" id="mob-tab-advanced" class="mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
                   <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
                   <span class="text-[10px] font-bold" data-i18n="tab_adv">Network</span>
               </button>
-              <button onclick="switchTab('logs')" id="mob-tab-logs" class="mobile-tab-item mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
+              <button onclick="switchTab('logs')" id="mob-tab-logs" class="mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
                   <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"></path></svg>
                   <span class="text-[10px] font-bold" data-i18n="tab_logs">Logs</span>
               </button>
-              <button onclick="switchTab('users')" id="mob-tab-users" class="mobile-tab-item mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
+              <button onclick="switchTab('users')" id="mob-tab-users" class="mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
                   <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
                   <span class="text-[10px] font-bold" data-i18n="tab_users">Users</span>
               </button>
@@ -6821,13 +6488,8 @@ function getDashboardUI(hasDB) {
                   lbl_u_max_config:"Max Configs",
                   login_password:"Password",
                   lbl_u_ipproxy:"User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)",
-                   lbl_custom_panel_url:"Custom Panel URL / Subscription Domain",
-                   lbl_api_keys: "Panel API Keys", desc_api_keys: "Generate API keys to securely connect remote panels. Remote panels use these keys instead of sharing your master key.",
-                   btn_generate_key: "Generate Key", api_key_created: "API Key Created! Copy it now — it won't be shown again.",
-                   api_keys_empty: "No API keys generated yet.", enter_key_name: "Enter a name for this API key:",
-                   confirm_revoke: "Revoke this API key? The remote panel will lose access.", revoke: "Revoke",
-                   created: "Created", last_used: "Last used", never: "Never",
-                   v_pop_title: "Release Notice", v_pop_whatsnew: "What's New", v_pop_headline: "New Features & Improvements",
+                  lbl_custom_panel_url:"Custom Panel URL / Subscription Domain",
+                  v_pop_title: "Release Notice", v_pop_whatsnew: "What's New", v_pop_headline: "New Features & Improvements",
                   v_pop_btn: "Got it!",
                   changelog_title: "Release Notes & Changelog:",
                   changelog_added: "Added", changelog_fixed: "Fixed", changelog_improved: "Improved", changelog_changed: "Changed", changelog_note: "Important Notes",
@@ -6836,12 +6498,8 @@ function getDashboardUI(hasDB) {
                   ov_system: "System", ov_recent_activity: "Recent Activity", ov_view_all: "View All →", ov_loading: "Loading...",
                    ov_quick_actions: "Quick Actions", ov_add_user: "Add User", ov_backup_config: "Backup Config", ov_refresh: "Refresh Statistics", ov_manage_users: "Manage Users",
                    ov_gb_unit: "GB",
-                    lbl_allow_sync:"Allow Sync",
-                    other_nodes_title: "Other Nodes", other_nodes_desc: "External nodes (URL + API Key) for cross-panel management.",
-                    add_node_title: "Add External Node", add_node_desc: "Enter the URL and API Key of the external panel.",
-                    add_node_url: "Node URL", add_node_apikey: "API Key", add_node_confirm: "Add Node", add_node_invalid: "Please enter both URL and API Key.",
-                    node_added: "Node added successfully!", node_removed: "Node removed.",
-                    deploy_btn: "Deploy Now", update_deploying: "Deploying update...",
+                   lbl_allow_sync:"Allow Sync",
+                   deploy_btn: "Deploy Now", update_deploying: "Deploying update...",
                    update_success: "Update successful! Reloading...", update_error: "Update failed",
                    lbl_cf_worker: "CF Worker Script Name", desc_cf_worker: "Required for in-panel updates. The script name shown in your Cloudflare Workers dashboard.",
                    view_github: "View on GitHub",
@@ -6869,7 +6527,6 @@ function getDashboardUI(hasDB) {
                     section_basic_info: "Basic Info", section_limits: "Limits", section_network: "Network", section_advanced: "Advanced",
                     lbl_nat64: "NAT64 Prefix", desc_nat64: "Optional. Converts IPv4 Proxy IPs to NAT64 IPv6 addresses. Supports multiple prefixes.",
                     lbl_direct_configs: "Include Direct Configs", desc_direct_configs: "Generate configs without Proxy IP alongside relay configs",
-                    lbl_sync_api_key: "Sync API Key (Slave Push)", desc_sync_api_key: "API key from a slave panel. Main uses this to push config. Same key must exist on each slave's Panel API Keys.",
                     lbl_auto_update: "Auto-Update", desc_auto_update: "Automatically deploy when a new version is detected",
                     lbl_auto_update_format: "Update Format", format_normal_label: "Normal", format_obfuscated_label: "Obfuscated",
                     desc_format_normal: "Standard _worker.js", desc_format_obfuscated: "XOR byte-shifting",
@@ -6880,8 +6537,6 @@ function getDashboardUI(hasDB) {
                     desc_proxy_ips: "Custom Proxy IPs (comma/newline)",
                     desc_clean_ips_modal: "Custom Clean IPs (comma/newline)",
                     btn_generate_uuid: "Generate UUID",
-                    lbl_conn_limit: "IP Connection Limit", desc_conn_limit: "Max simultaneous connections per user. Leave empty for unlimited.",
-                    lbl_user_panel_url: "Main Panel URL (Custom Nodes)", desc_user_panel_url: "Main panel domain for custom nodes. If empty, default panel URL is used.",
                     html_desc_strategy: "Supported placeholders: <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{FLAG}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{COUNTRY}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{CITY}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{ISP}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PROTOCOL}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{USER}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PORT}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PREFIX}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{IP}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{HOST}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{DATE}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{INDEX}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{WORKER}</code>.<br><span class='text-[10px] text-slate-400 dark:text-slate-500 leading-snug'>• <b>{FLAG}</b>: Country flag emoji (e.g. 🇺🇸).<br>• <b>{COUNTRY}</b>: Country name (e.g. United States).<br>• <b>{CITY}</b>: City name (e.g. San Francisco).<br>• <b>{ISP}</b>: ISP / ASN org (e.g. Cloudflare, Inc.).<br>• <b>{PROTOCOL}</b>: Core mode (VLESS / Trojan).<br>• <b>{USER}</b>: Subscriber name.<br>• <b>{PORT}</b>: Active port.<br>• <b>{PREFIX}</b>: Custom prefix.<br>• <b>{IP}</b>: Clean IP address.<br>• <b>{HOST}</b>: Hostname.<br>• <b>{DATE}</b>: Current date (YYYY-MM-DD).<br>• <b>{INDEX}</b>: Config index (0, 1, 2...).<br>• <b>{WORKER}</b>: Worker name from config.</span><br>Pre-defined strategies: <code>default</code>, <code>type-user-port</code>, <code>user-port</code>, <code>host-port-user</code>, <code>prefix-user-port</code>, <code>ip</code>.",
                },
               fa: {
@@ -6896,13 +6551,8 @@ function getDashboardUI(hasDB) {
                   lbl_fake_configs: "ورودی‌های اطلاعاتی اشتراک", desc_fake_configs: "متن نمایشی ورودی‌ها در پروفایل اشتراک را سفارشی کنید. از {usage} و {expiry} برای مقادیر پویا استفاده کنید.", btn_add_entry: "افزودن ورودی", lbl_tg_token: "توکن ربات تلگرام", lbl_tg_chat: "شناسه عددی تلگرام", lbl_tg_admin: "شناسه مدیر تلگرام", desc_tg_admin: "فقط این شناسه کاربری تلگرام می‌تواند پنل را از طریق ربات مدیریت کند. خالی بگذارید برای استفاده از شناسه چت.", desc_tg_bot: "با تنظیم این مقادیر، جزئیات ورود به پنل به تلگرام ارسال می‌شود.",
                   lbl_cf_acc: "شناسه اکانت ابری", lbl_cf_token: "توکن دسترسی کاربری", desc_cf_api: "اختیاری: برای نمایش میزان مصرف روزانه کارگر از صد هزار درخواست رایگان در پیام‌های تلگرام.",
                   lbl_silent: "هشدار و پیغام خاموش", lbl_pause: "کلید توقف اضطراری",
-                   lbl_sub_ua: "یوزراجنت سفارشی ساب", desc_sub_ua: "درخواست‌های مرورگر که حاوی این متن باشند، استتار را خنثی کرده و مستقیم به ساب دسترسی پیدا می‌کنند.",
-                   lbl_api_keys: "کلیدهای API پنل", desc_api_keys: "کلیدهای API برای اتصال امن پنل‌های راهدور ایجاد کنید. پنل‌های راهدور به جای اشتراک‌گذاری کلید اصلی، از این کلیدها استفاده می‌کنند.",
-                   btn_generate_key: "ایجاد کلید", api_key_created: "کلید API ایجاد شد! آن را کپی کنید — دوباره نمایش داده نخواهد شد.",
-                   api_keys_empty: "هنوز کلید API ایجاد نشده.", enter_key_name: "نامی برای این کلید API وارد کنید:",
-                   confirm_revoke: "این کلید API لغو شود؟ پنل راهدور دسترسی خود را از دست خواهد داد.", revoke: "لغو",
-                   created: "ایجاد شده", last_used: "آخرین استفاده", never: "هرگز",
-                   tab_users: "کاربران",
+                  lbl_sub_ua: "یوزراجنت سفارشی ساب", desc_sub_ua: "درخواست‌های مرورگر که حاوی این متن باشند، استتار را خنثی کرده و مستقیم به ساب دسترسی پیدا می‌کنند.",
+                  tab_users: "کاربران",
                   user_mgt_title: "مدیریت کاربران", user_mgt_desc: "مدیریت کاربران متعدد، تنظیم محدودیت ترافیک، و تاریخ انقضا.", btn_add_user: "+ افزودن کاربر جدید",
                   tbl_name: "نام", tbl_uuid: "شناسه یکتا", tbl_traffic: "ترافیک (مصرفی/محدودیت)", tbl_exp: "انقضا", tbl_action: "عملیات", no_users: "کاربری یافت نشد. از دکمه بالا یک کاربر ایجاد کنید.",
                   modal_add_title: "افزودن کاربر جدید", lbl_u_name: "نام (الزامی)", lbl_u_gb: "محدودیت ترافیک (گیگابایت) - اختیاری", lbl_u_days: "مدت زمان اعتبار (روز) - اختیاری", btn_cancel: "انصراف", btn_confirm: "افزودن کاربر",
@@ -6932,7 +6582,6 @@ function getDashboardUI(hasDB) {
                     section_basic_info: "اطلاعات پایه", section_limits: "محدودیت‌ها", section_network: "شبکه", section_advanced: "پیشرفته",
                     lbl_nat64: "پیشوند NAT64", desc_nat64: "اختیاری. آی‌پی‌های پروکسی IPv4 را به آدرس‌های NAT64 IPv6 تبدیل می‌کند. چند پیشوند پشتیبانی می‌شود.",
                     lbl_direct_configs: "شامل کانفیگ‌های مستقیم", desc_direct_configs: "تولید کانفیگ‌ها بدون آی‌پی پروکسی در کنار کانفیگ‌های رله",
-                    lbl_sync_api_key: "کلید API همگام‌سازی (ارسال به اسلیو)", desc_sync_api_key: "کلید API از پنل اسلیو. پنل اصلی با این کلید کانفیگ را ارسال می‌کند. این کلید باید در کلیدهای API پنل اسلیو وجود داشته باشد.",
                     lbl_auto_update: "بروزرسانی خودکار", desc_auto_update: "دپلوی خودکار هنگام شناسایی نسخه جدید",
                     lbl_auto_update_format: "قالب بروزرسانی", format_normal_label: "معمولی", format_obfuscated_label: "مبهم‌سازی شده",
                     desc_format_normal: "استاندارد _worker.js", desc_format_obfuscated: "جابجایی بایت XOR",
@@ -6943,8 +6592,6 @@ function getDashboardUI(hasDB) {
                     desc_proxy_ips: "آی‌پی‌های پروکسی سفارشی (کاما/خط جدید)",
                     desc_clean_ips_modal: "آی‌پی‌های تمیز سفارشی (کاما/خط جدید)",
                     btn_generate_uuid: "تولید UUID",
-                    lbl_conn_limit: "محدودیت اتصال همزمان", desc_conn_limit: "حداکثر اتصالات همزمان برای هر کاربر. برای نامحدود خالی بگذارید.",
-                    lbl_user_panel_url: "آدرس پنل اصلی (نودهای سفارشی)", desc_user_panel_url: "دامنه پنل اصلی برای نودهای سفارشی. اگر خالی باشد، آدرس پنل پیش‌فرض استفاده می‌شود.",
                   metrics_live: "وضعیت زنده مصرف اتصالات و پردازش", no_metrics: "هنوز داده‌ای از تراکنش و اتصالات فعال ثبت نشده است.", run_diagnostics: "⚡ اجرای عیب‌یابی شبکه",
                   target_node: "هدف گره شبکه", response: "مدت زمان تاخیر پاسخگویی", status: "وضعیت گره", local_port: "درگاه محلی",
                   lbl_doh: "تحلیل‌گر تخصصی آدرس‌یابی عددی", lbl_strategy: "روش نام‌گذاری کانفیگ‌ها", lbl_prefix: "پیشوند نام کانفیگ‌ها",
@@ -6972,10 +6619,6 @@ function getDashboardUI(hasDB) {
                    ov_quick_actions: "عملیات سریع", ov_add_user: "افزودن کاربر", ov_backup_config: "پشتیبان‌گیری", ov_refresh: "بروزرسانی آمار", ov_manage_users: "مدیریت کاربران",
                    ov_gb_unit: "گیگابایت",
                      lbl_allow_sync:"اجازه همگام سازی",
-                     other_nodes_title: "سایر نودها", other_nodes_desc: "نودهای خارجی (URL + کلید API) برای مدیریت بین پنل‌ها.",
-                     add_node_title: "افزودن نود خارجی", add_node_desc: "آدرس URL و کلید API پنل خارجی را وارد کنید.",
-                     add_node_url: "آدرس نود", add_node_apikey: "کلید API", add_node_confirm: "افزودن نود", add_node_invalid: "لطفاً URL و کلید API را وارد کنید.",
-                     node_added: "نود با موفقیت اضافه شد!", node_removed: "نود حذف شد.",
                       deploy_btn: "هم‌اکنون نصب کن", update_deploying: "در حال نصب بروزرسانی...",
                       update_success: "بروزرسانی موفق! در حال بارگذاری...", update_error: "خطا در بروزرسانی",
                       lbl_cf_worker: "نام اسکریپت کارگر ابری", desc_cf_worker: "برای بروزرسانی خودکار الزامی است. نام اسکریپت در داشبورد کارگرهای ابری.",
@@ -6986,28 +6629,6 @@ function getDashboardUI(hasDB) {
           };
 
           const CHANGELOG_DATA = {
-              "2.9.0": {
-                  headline: { en: "Trojan Protocol Fix & Per-Config Relay IP Routing", fa: "رفع پروتکل تروجان و مسیریابی آی‌پی رله به‌ازای هر کانفیگ" },
-                  added: [
-                      { en: "Per-config relay IP routing for Trojan via WebSocket path payload — Trojan nodes now route through their designated relay IP (USA→USA, Germany→Germany) just like VLESS", fa: "مسیریابی آی‌پی رله به‌ازای هر کانفیگ تروjan از طریق مسیر وب‌ساکت — نودهای تروjan اکنون مانند VLESS از طریق آی‌پی رله تعیین‌شده خود مسیریابی می‌کنند" },
-                      { en: "Server-side relay index extraction with triple fallback: query parameter → numeric path segment → base64 JSON payload", fa: "استخراج شاخص رله سمت سرور با زنجیره سه‌گانه بازگشت: پارامتر کوئری → بخش عددی مسیر → بار پیلود JSON باینری" },
-                      { en: "Device connection limit per user (connLimit) — cap simultaneous connections per subscriber", fa: "محدودیت اتصال دستگاه به‌ازای هر کاربر (connLimit) — محدود کردن اتصالات همزمان هر مشترک" },
-                      { en: "Panel API key system for secure node-to-panel authentication", fa: "سیستم کلید API پنل برای احراز هویت امن اتصال نود به پنل" },
-                      { en: "Mobile-friendly add/edit user modals with improved responsive layout", fa: "فرم‌های افزودن/ویرایش کاربر سازگار با موبایل با طرح‌بندی واکنش‌گرا بهبودیافته" }
-                  ],
-                  fixed: [
-                      { en: "Fixed Trojan header offset parsing (hPos+2 → hPos+4) — Trojan connections were silently dropping the first 2 bytes of payload data after the port field", fa: "رفع خطای اندازه‌گیری افست هدر تروjan (hPos+2 → hPos+4) — اتصالات تروjan به‌طور خاموش ۲ بایت اول داده پس از فیلد پورت را حذف می‌کردند" },
-                      { en: "Fixed Trojan password being set to generated configUuid instead of raw user UUID — clients could never authenticate because SHA224(configUuid) ≠ SHA224(p.id)", fa: "رفع اشتباه بودن رمز عبور تروjan به configUuid تولیدشده به‌جای UUID خام کاربر — کلاینت‌ها هرگز نمی‌توانستند احراز هویت کنند چون SHA224(configUuid) ≠ SHA224(p.id)" },
-                      { en: "Added SHA224 hash registration in configRegistry so Trojan lookup works via configRegistry when isolate is warm", fa: "افزودن ثبت هش SHA224 در configRegistry تا جستجوی تروjan در isolate گرم از طریق configRegistry کار کند" },
-                      { en: "Fixed Maintenance Hosts (Camouflage) and Sync API Key (Slave Push) shown in Advanced tab Proxy Relay IP section — removed as requested", fa: "حذف میزبان‌های نگهداری (استتار) و کلید API همگام‌سازی (ارسال به اسلیو) از بخش آدرس پروکسی پیشرفته درخواست شده" }
-                  ],
-                  improved: [
-                      { en: "Trojan relay IP routing now uses the same base64 JSON WebSocket path payload format as VLESS for maximum client compatibility", fa: "مسیریابی آی‌پی رله تروjan اکنون از همان قالب پیلود مسیر وب‌ساکت JSON باینری VLESS برای حداکثر سازگاری با کلاینت‌ها استفاده می‌کند" },
-                      { en: "Relay IP resolution uses getEffectivePips with NAT64 awareness for both VLESS and Trojan protocols", fa: "解析 آدرس رله از getEffectivePips با آگاهی NAT64 برای هر دو پروتکل VLESS و Trojan استفاده می‌کند" },
-                      { en: "Added reqPath variable to buildYamlProfile for consistent path generation", fa: "افزودن متغیر reqPath به buildYamlProfile برای تولید مسیر یکپارچه" }
-                  ],
-                  notes: []
-              },
               "2.6.0": {
                   headline: { en: "Bilingual Subscription Page & NAT64 Support", fa: "صفحه اشتراک چندزبانه و پشتیبانی NAT64" },
                   added: [
@@ -7412,15 +7033,7 @@ function getDashboardUI(hasDB) {
                       deskBtn.classList.remove('active'); mobBtn.classList.remove('active');
                   }
               });
-            document.getElementById('view-add-user').classList.add('hidden');
-            document.getElementById('view-edit-user').classList.add('hidden');
-            var sc = document.querySelector('.scroll-content');
-            sc.style.overflow = '';
-            sc.classList.remove('flex', 'flex-col');
-            sc.firstElementChild.classList.remove('flex-1', 'min-h-0', 'flex', 'flex-col');
             updateTitle();
-            var sc = document.querySelector('.scroll-content');
-            if (sc) sc.scrollTop = 0;
             if(tab === 'overview') loadDashboard();
             if(tab === 'logs') loadLogs();
             if(tab === 'network') doLogin(true); // refresh metrics
@@ -7492,7 +7105,6 @@ function getDashboardUI(hasDB) {
             } catch (err) {
                 console.error('Dashboard load error:', err);
             }
-            loadApiKeys();
         }
 
           function copyData(id) {
@@ -7549,55 +7161,6 @@ function getDashboardUI(hasDB) {
           function logout() {
               localStorage.removeItem('nahan_session');
               window.location.reload();
-          }
-
-          function showAddNodeModal() {
-              document.getElementById('modal-add-node').classList.remove('hidden');
-              document.getElementById('add-node-url').value = '';
-              document.getElementById('add-node-apikey').value = '';
-              document.getElementById('add-node-url').focus();
-          }
-
-          function commitAddNode() {
-              const url = document.getElementById('add-node-url').value.trim();
-              const apiKey = document.getElementById('add-node-apikey').value.trim();
-              if (!url || !apiKey) {
-                  const t = i18n[lang] || i18n['en'];
-                  alert(t.add_node_invalid || 'Please enter both URL and API Key.');
-                  return;
-              }
-              if (!window.nahanConfig) window.nahanConfig = {};
-              if (!Array.isArray(window.nahanConfig.linkedPanels)) window.nahanConfig.linkedPanels = [];
-              window.nahanConfig.linkedPanels.push({ url, apiKey });
-              document.getElementById('modal-add-node').classList.add('hidden');
-              renderLinkedNodes();
-          }
-
-          function removeLinkedNode(idx) {
-              if (!window.nahanConfig || !Array.isArray(window.nahanConfig.linkedPanels)) return;
-              window.nahanConfig.linkedPanels.splice(idx, 1);
-              renderLinkedNodes();
-          }
-
-          function renderLinkedNodes() {
-              const list = document.getElementById('linked-nodes-list');
-              if (!list) return;
-              const panels = (window.nahanConfig && Array.isArray(window.nahanConfig.linkedPanels)) ? window.nahanConfig.linkedPanels : [];
-              if (panels.length === 0) {
-                  list.innerHTML = '<p class="text-xs text-slate-400 dark:text-slate-500 italic">' + ((i18n[lang] || i18n['en']).no_nodes_advanced || 'No external nodes added yet.') + '</p>';
-                  return;
-              }
-              list.innerHTML = panels.map((p, i) => \`
-                  <div class="flex items-center justify-between gap-2 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-darkborder/50">
-                      <div class="min-w-0 flex-1">
-                          <p class="text-sm font-mono font-bold text-slate-700 dark:text-slate-200 truncate">\${p.url}</p>
-                          <p class="text-[11px] text-slate-400 dark:text-slate-500 font-mono truncate">\${p.apiKey.substring(0, 12)}...</p>
-                      </div>
-                      <button onclick="removeLinkedNode(\${i})" class="p-1.5 hover:bg-red-100 dark:hover:bg-red-900/30 rounded-lg transition-colors shrink-0" title="Remove">
-                          <svg class="w-3.5 h-3.5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-                      </button>
-                  </div>
-              \`).join('');
           }
 
           function renderFakeConfigs(configs) {
@@ -7679,17 +7242,16 @@ function getDashboardUI(hasDB) {
               const payload = {
                   mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
                   apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                   resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value, nat64Prefix: el('cfg-nat64') ? el('cfg-nat64').value : '', enableDirectConfigs: el('cfg-direct-configs') ? el('cfg-direct-configs').checked : false, syncApiKey: el('cfg-sync-api-key') ? el('cfg-sync-api-key').value.trim() : '', autoUpdate: el('cfg-auto-update') ? el('cfg-auto-update').checked : false, autoUpdateFormat: document.querySelector('input[name="auto-update-format"]:checked')?.value || 'normal',
-                   enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
-                   tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
+                  resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value, nat64Prefix: el('cfg-nat64') ? el('cfg-nat64').value : '', enableDirectConfigs: el('cfg-direct-configs') ? el('cfg-direct-configs').checked : false, autoUpdate: el('cfg-auto-update') ? el('cfg-auto-update').checked : false, autoUpdateFormat: document.querySelector('input[name="auto-update-format"]:checked')?.value || 'normal',
+                  enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
+                  tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
                   cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
                   cfWorkerName: el('cfg-cf-worker').value,
                   isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked,
                   githubRepo: el('cfg-github-repo').value,
                   subUserAgent: el('cfg-sub-ua').value,
                   customPanelUrl: el('cfg-custom-panel-url').value,
-                  fakeConfigs: getFakeConfigsFromUI(),
-                  linkedPanels: (window.nahanConfig && Array.isArray(window.nahanConfig.linkedPanels)) ? window.nahanConfig.linkedPanels : []
+                  fakeConfigs: getFakeConfigsFromUI()
               };
               const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(payload, null, 2));
               const dlAnchor = document.createElement('a');
@@ -7737,7 +7299,6 @@ function getDashboardUI(hasDB) {
                       if (conf.silentAlerts !== undefined) document.getElementById('cfg-silent').checked = conf.silentAlerts;
                       mapId('cfg-nat64', conf.nat64Prefix);
                       if (conf.enableDirectConfigs !== undefined && document.getElementById('cfg-direct-configs')) document.getElementById('cfg-direct-configs').checked = conf.enableDirectConfigs;
-                      if (document.getElementById('cfg-sync-api-key')) document.getElementById('cfg-sync-api-key').value = conf.syncApiKey || '';
                       if (conf.autoUpdate !== undefined && document.getElementById('cfg-auto-update')) {
                           document.getElementById('cfg-auto-update').checked = conf.autoUpdate;
                           const wrap = document.getElementById('auto-update-format-wrap');
@@ -7749,11 +7310,6 @@ function getDashboardUI(hasDB) {
                       }
                       
                       if (conf.fakeConfigs) renderFakeConfigs(conf.fakeConfigs);
-                      if (conf.linkedPanels) {
-                          if (!window.nahanConfig) window.nahanConfig = {};
-                          window.nahanConfig.linkedPanels = conf.linkedPanels;
-                          renderLinkedNodes();
-                      }
                       
                       updateUI();
                       alert(lang === 'fa' ? 'پیکربندی با موفقیت وارد شد! روی ذخیره کلیک کنید.' : 'Configuration parsed! Click save to write changes.');
@@ -7849,11 +7405,11 @@ function getDashboardUI(hasDB) {
                       document.getElementById('cfg-dns').value = conf.resolveIp || '';
                       document.getElementById('cfg-custom-dns').value = conf.customDns || 'https://cloudflare-dns.com/dns-query';
                       document.getElementById('cfg-ips').value = conf.cleanIps || '';
+                      document.getElementById('cfg-nodes').value = conf.slaveNodes || '';
                       document.getElementById('cfg-fake').value = conf.maintenanceHost || '';
                        document.getElementById('cfg-relay').value = conf.backupRelay || '';
                        if (document.getElementById('cfg-nat64')) document.getElementById('cfg-nat64').value = conf.nat64Prefix || '';
                        if (document.getElementById('cfg-direct-configs')) document.getElementById('cfg-direct-configs').checked = conf.enableDirectConfigs || false;
-                       if (document.getElementById('cfg-sync-api-key')) document.getElementById('cfg-sync-api-key').value = conf.syncApiKey || '';
                        if (document.getElementById('cfg-auto-update')) {
                            document.getElementById('cfg-auto-update').checked = conf.autoUpdate || false;
                            const wrap = document.getElementById('auto-update-format-wrap');
@@ -7865,6 +7421,7 @@ function getDashboardUI(hasDB) {
                        }
                       document.getElementById('cfg-tfo').checked = conf.enableOpt1 || false;
                       document.getElementById('cfg-ech').checked = conf.enableOpt2 || false;
+                      document.getElementById('cfg-allow-sync').checked = conf.allowSyncWorker || false;
                       document.getElementById('cfg-tg-token').value = conf.tgToken || '';
                       document.getElementById('cfg-tg-chat').value = conf.tgChatId || '';
                       document.getElementById('cfg-tg-admin').value = conf.tgAdminId || '';
@@ -7887,11 +7444,10 @@ function getDashboardUI(hasDB) {
                       window.nahanUsage = data.sysUsage || {};
                       window.nahanProfiles = data.profiles || [];
                       renderUsersTable();
-                      renderLinkedNodes();
                       try { checkUpdate(); } catch(ue) { console.error(ue); }
                       if (!silent) switchTab('overview');
 
-                      ['cfg-proto','cfg-port','cfg-fp','cfg-ips','cfg-path', 'cfg-relay', 'cfg-name-strategy', 'cfg-name-prefix', 'cfg-sub-ua', 'cfg-custom-panel-url'].forEach(id => {
+                      ['cfg-proto','cfg-port','cfg-fp','cfg-ips','cfg-nodes','cfg-path', 'cfg-relay', 'cfg-name-strategy', 'cfg-name-prefix', 'cfg-sub-ua', 'cfg-custom-panel-url'].forEach(id => {
                           const el = document.getElementById(id);
                           if(el) { el.addEventListener('input', updateUI); el.addEventListener('change', updateUI); }
                       });
@@ -8012,7 +7568,7 @@ function getDashboardUI(hasDB) {
                   config: {
                       mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
                       apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                      resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value, nat64Prefix: el('cfg-nat64') ? el('cfg-nat64').value : '', enableDirectConfigs: el('cfg-direct-configs') ? el('cfg-direct-configs').checked : false, syncApiKey: el('cfg-sync-api-key') ? el('cfg-sync-api-key').value.trim() : '', autoUpdate: el('cfg-auto-update') ? el('cfg-auto-update').checked : false, autoUpdateFormat: document.querySelector('input[name="auto-update-format"]:checked')?.value || 'normal',
+                      resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value, nat64Prefix: el('cfg-nat64') ? el('cfg-nat64').value : '', enableDirectConfigs: el('cfg-direct-configs') ? el('cfg-direct-configs').checked : false, autoUpdate: el('cfg-auto-update') ? el('cfg-auto-update').checked : false, autoUpdateFormat: document.querySelector('input[name="auto-update-format"]:checked')?.value || 'normal',
                       enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
                       tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
                       cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
@@ -8022,9 +7578,9 @@ function getDashboardUI(hasDB) {
                       subUserAgent: el('cfg-sub-ua').value,
                       customPanelUrl: el('cfg-custom-panel-url').value,
                       nameStrategy: el('cfg-name-strategy').value,
+                      allowSyncWorker: el('cfg-allow-sync').checked,
                       namePrefix: el('cfg-name-prefix').value,
-                      fakeConfigs: getFakeConfigsFromUI(),
-                      linkedPanels: (window.nahanConfig && Array.isArray(window.nahanConfig.linkedPanels)) ? window.nahanConfig.linkedPanels : []
+                      fakeConfigs: getFakeConfigsFromUI()
                   }
               };
                         //update user port after change global
@@ -8041,28 +7597,58 @@ function getDashboardUI(hasDB) {
                   const data = await res.json();
                   if (data.success) {
                       stat.textContent = i18n[lang].msg_saved; stat.className = "text-sm font-bold text-emerald-500 md:me-4";
-                      if (Array.isArray(window.nahanConfig?.linkedPanels) && window.nahanConfig.linkedPanels.length > 0) {
-                          const sc = payload.config;
-                          const slaveCfg = { ...sc };
-                          delete slaveCfg.tgToken; delete slaveCfg.tgChatId; delete slaveCfg.tgAdminId; delete slaveCfg.tgBotLang;
-                          delete slaveCfg.cfAccountId; delete slaveCfg.cfApiToken; delete slaveCfg.cfWorkerName;
-                          delete slaveCfg.panelApiKeys; delete slaveCfg.linkedPanels; delete slaveCfg.slaveNodes; delete slaveCfg.syncApiKey;
-                          const synced = new Set();
-                          window.nahanConfig.linkedPanels.forEach(p => {
-                              if (!p || !p.url || !p.apiKey) return;
-                              const h = p.url.trim().replace(/^https?:\\/\\//, '').replace(/\\/.*$/, '');
-                              if (!h || synced.has(h.toLowerCase())) return;
-                              synced.add(h.toLowerCase());
-                              fetch('https://' + h + '/' + encodeURIComponent(sc.apiRoute || 'sync') + '/api/sync', {
-                                  method: 'POST',
-                                  headers: { 'Content-Type': 'application/json' },
-                                  body: JSON.stringify({ key: p.apiKey, config: slaveCfg, fromMaster: true })
-                              }).then(r => { if (!r.ok) console.error('Sync to ' + h + ' failed: HTTP ' + r.status); }).catch(e => { console.error('Sync to ' + h + ' error:', e.message); });
-                          });
-                      }
                       setTimeout(() => window.location.href = '/' + data.newRoute + '/dash', 1000);
                   } else { stat.textContent = i18n[lang].msg_err; stat.className = "text-sm font-bold text-red-500 md:me-4"; }
               } catch(e) { stat.textContent = i18n[lang].msg_err; stat.className = "text-sm font-bold text-red-500 md:me-4"; }
+          }
+          
+          async function forceSyncNodes() {
+              const nodesRaw = document.getElementById('cfg-nodes').value;
+              if (!nodesRaw || nodesRaw.trim() === '') {
+                  const noSlaveMsg = lang === 'fa' ? 'هیچ نود فرعی مشخص نشده است.' : 'No slave nodes specified.';
+                  alert(noSlaveMsg);
+                  return;
+              }
+              const btnTxt = document.getElementById('sync-btn-txt');
+              const icon = document.getElementById('sync-icon');
+              
+              btnTxt.innerText = 'Syncing...';
+              icon.classList.add('animate-spin');
+              
+              const el = id => document.getElementById(id);
+              const payload = {
+                  key: sessionKey,
+                  config: {
+                      mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
+                      apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
+                      resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value, nat64Prefix: el('cfg-nat64') ? el('cfg-nat64').value : '', enableDirectConfigs: el('cfg-direct-configs') ? el('cfg-direct-configs').checked : false, autoUpdate: el('cfg-auto-update') ? el('cfg-auto-update').checked : false, autoUpdateFormat: document.querySelector('input[name="auto-update-format"]:checked')?.value || 'normal',
+                      enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
+                      tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
+                      cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
+                      cfWorkerName: el('cfg-cf-worker').value,
+                      isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked,
+                      githubRepo: el('cfg-github-repo').value,
+                      subUserAgent: el('cfg-sub-ua').value,
+                      customPanelUrl: el('cfg-custom-panel-url').value,
+                      nameStrategy: el('cfg-name-strategy').value,
+                      namePrefix: el('cfg-name-prefix').value,
+                      fakeConfigs: getFakeConfigsFromUI()
+                  }
+              };
+              
+              try {
+                  const res = await fetch(baseRoute + '/api/sync', { method: 'POST', body: JSON.stringify(payload) });
+                  if (res.ok) {
+                      btnTxt.innerText = 'Success!';
+                  } else {
+                      btnTxt.innerText = 'Sync Failed';
+                  }
+              } catch (e) {
+                  btnTxt.innerText = 'Network Error';
+              } finally {
+                  icon.classList.remove('animate-spin');
+                  setTimeout(() => { btnTxt.innerText = 'Force Sync Now'; }, 3000);
+              }
           }
 
           document.getElementById('pwd').addEventListener('keypress', e => { if (e.key === 'Enter') doLogin(); });
@@ -8186,13 +7772,13 @@ function getDashboardUI(hasDB) {
                   let resetTitle = lang === 'fa' ? 'بازنشانی مصرف ترافیک' : 'Reset Traffic Metrics';
                   let deleteTitle = lang === 'fa' ? 'حذف کاربر' : 'Delete User';
 
-                   let linkHtml = \`<button onclick="copyData('sync-\${u.id}')" class="native-press flex-1 flex items-center justify-center text-primary hover:text-indigo-700 bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-900/30 dark:hover:bg-indigo-800/50 py-2 rounded-lg" title="\${linkTitle}">🔗</button>\`;
-                   
-                   let pauseBtnHtml = \`<button onclick="togglePauseUser('\${u.id}')" class="native-press flex-1 flex items-center justify-center \${u.isPaused ? 'text-green-500 hover:text-green-700 bg-green-50 hover:bg-green-100 dark:bg-green-900/30 dark:hover:bg-green-800/50' : 'text-amber-500 hover:text-amber-700 bg-amber-50 hover:bg-amber-100 dark:bg-amber-900/30 dark:hover:bg-amber-800/50'} py-2 rounded-lg" title="\${pauseTitle}">\\s*\${u.isPaused ? '▶️' : '⏸️'}</button>\`;
+                  let linkHtml = \`<button onclick="copyData('sync-\${u.id}')" class="text-primary hover:text-indigo-700 bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-900/30 dark:hover:bg-indigo-800/50 p-2 rounded-lg" title="\${linkTitle}">🔗</button>\`;
+                  
+                  let pauseBtnHtml = \`<button onclick="togglePauseUser('\${u.id}')" class="\${u.isPaused ? 'text-green-500 hover:text-green-700 bg-green-50 hover:bg-green-100 dark:bg-green-900/30 dark:hover:bg-green-800/50' : 'text-amber-500 hover:text-amber-700 bg-amber-50 hover:bg-amber-100 dark:bg-amber-900/30 dark:hover:bg-amber-800/50'} p-2 rounded-lg" title="\${pauseTitle}">\\s*\${u.isPaused ? '▶️' : '⏸️'}</button>\`;
 
-                   let editBtnHtml = \`<button onclick="editUser('\${u.id}')" class="native-press flex-1 flex items-center justify-center text-indigo-500 hover:text-indigo-700 bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-900/30 dark:hover:bg-indigo-800/50 py-2 rounded-lg" title="\${editTitle}">✏️</button>\`;
+                  let editBtnHtml = \`<button onclick="editUser('\${u.id}')" class="text-indigo-500 hover:text-indigo-700 bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-900/30 dark:hover:bg-indigo-800/50 p-2 rounded-lg" title="\${editTitle}">✏️</button>\`;
 
-                   let resetBtnHtml = \`<button onclick="resetUserTraffic('\${u.id}')" class="native-press flex-1 flex items-center justify-center text-violet-500 hover:text-violet-700 bg-violet-50 hover:bg-violet-100 dark:bg-violet-900/30 dark:hover:bg-violet-800/50 py-2 rounded-lg" title="\${resetTitle}">🔄</button>\`;
+                  let resetBtnHtml = \`<button onclick="resetUserTraffic('\${u.id}')" class="text-violet-500 hover:text-violet-700 bg-violet-50 hover:bg-violet-100 dark:bg-violet-900/30 dark:hover:bg-violet-800/50 p-2 rounded-lg" title="\${resetTitle}">🔄</button>\`;
 
                   let isAutoDisabled = u.isPaused && u.disabledReason;
                   let disableInfoHtml = '';
@@ -8218,60 +7804,43 @@ function getDashboardUI(hasDB) {
                       rawSync += rawSync.includes('?') ? '&flag=a' : '?flag=a';
                   }
 
-                  tblHtml += \`<div class="native-press bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder p-4 hover:shadow-md transition-shadow">
-                      <div class="flex items-center justify-between mb-3">
-                          <div class="flex items-center gap-2 min-w-0 flex-1">
+                  tblHtml += \`<div class="bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder p-4 hover:shadow-md transition-shadow">
+                      <div class="flex items-center justify-between mb-2">
+                          <div class="flex items-center gap-2 min-w-0">
                               <span class="w-2 h-2 rounded-full shrink-0 \${u.isPaused ? (isAutoDisabled ? 'bg-red-500' : 'bg-amber-500') : (isExp ? 'bg-red-400' : 'bg-emerald-500')}"></span>
                               <span class="font-bold text-sm text-slate-800 dark:text-slate-100 truncate">\${u.name}</span>
-                              \${u.proxyIpGeo ? \`<span class="text-[10px] px-1.5 py-0.5 rounded bg-violet-50 dark:bg-violet-900/30 text-violet-600 dark:text-violet-300 font-semibold shrink-0">\${u.proxyIpGeo.flag}</span>\` : ''}
+                              \${u.proxyIpGeo ? \`<span class="text-[10px] px-1.5 py-0.5 rounded bg-violet-50 dark:bg-violet-900/30 text-violet-600 dark:text-violet-300 font-semibold">\${u.proxyIpGeo.flag}</span>\` : ''}
                           </div>
                           <input type="hidden" id="sync-\${u.id}" value="\${rawSync}">
+                          <div class="flex items-center gap-1 shrink-0">
+                              \${linkHtml}
+                              \${pauseBtnHtml}
+                              \${editBtnHtml}
+                              \${resetBtnHtml}
+                              <button onclick="deleteUser('\${u.id}')" class="text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 p-2 rounded-lg transition-colors" title="\${deleteTitle}">🗑️</button>
+                          </div>
                       </div>
-                      <div class="flex items-center gap-1 mb-3">
-                          \${linkHtml}
-                          \${pauseBtnHtml}
-                          \${editBtnHtml}
-                          \${resetBtnHtml}
-                          <button onclick="deleteUser('\${u.id}')" class="native-press flex-1 flex items-center justify-center text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 py-2 rounded-lg transition-colors text-sm" title="\${deleteTitle}">🗑️</button>
-                      </div>
-                      <div class="flex flex-wrap gap-1 mb-3">
+                      <div class="flex flex-wrap gap-1 mb-2">
                           \${u.isPaused && u.disabledReason ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-300">Auto-Disabled</span>\` : ''}
                           \${u.userMode ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-300">\${u.userMode === 'alpha' ? 'VLESS' : u.userMode === 'beta' ? 'Trojan' : 'Both'}</span>\` : ''}
                           \${u.userPorts ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-300">\${u.userPorts}</span>\` : ''}
-                           \${u.maxConfigs ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-300">\${u.maxConfigs} cfgs</span>\` : ''}
-                           \${u.connLimit ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-cyan-50 dark:bg-cyan-900/30 text-cyan-600 dark:text-cyan-300">\${u.connLimit} conn</span>\` : ''}
+                          \${u.maxConfigs ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-300">\${u.maxConfigs} cfgs</span>\` : ''}
                       </div>
                       \${disableInfoHtml}
-                      <div class="grid grid-cols-2 gap-3">
-                          <div class="bg-slate-50 dark:bg-slate-800/50 rounded-xl p-2.5">
-                              <div class="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">\${totalLabel}</div>
-                              <div class="text-sm font-black text-slate-800 dark:text-white">\${(userReqs/6000).toFixed(2)} <span class="text-[10px] font-semibold text-slate-400">GB</span></div>
-                              \${u.limitTotalReq ? \`
-                              <div class="w-full bg-slate-200 dark:bg-slate-700 h-1.5 rounded-full overflow-hidden mt-1.5">
-                                  <div class="bg-gradient-to-r \${parseFloat(perT) > 85 ? 'from-red-500 to-rose-600' : parseFloat(perT) > 60 ? 'from-amber-500 to-orange-500' : 'from-emerald-500 to-teal-500'} h-full rounded-full" style="width: \${perT}"></div>
-                              </div>
-                              <div class="flex items-center justify-between mt-1">
-                                  <span class="text-[9px] text-slate-400">/ \${(u.limitTotalReq/6000).toFixed(2)} GB</span>
-                                  \${perT !== '-' ? \`<span class="text-[9px] font-bold \${parseFloat(perT) > 85 ? 'text-red-500' : parseFloat(perT) > 60 ? 'text-amber-500' : 'text-emerald-500'}">\${perT}</span>\` : ''}
-                              </div>
-                              \` : '<div class="text-[9px] text-slate-400 mt-1">' + unlimitedTxt + '</div>'}
+                      <div class="space-y-1.5">
+                          <div class="flex items-center justify-between text-[11px]">
+                              <span class="text-slate-500">\${totalLabel} \${(userReqs/6000).toFixed(2)} GB \${u.limitTotalReq ? '/ ' + (u.limitTotalReq/6000).toFixed(2) + ' GB' : ''}</span>
+                              \${perT !== '-' ? \`<span class="font-bold \${parseFloat(perT) > 85 ? 'text-red-500' : parseFloat(perT) > 60 ? 'text-amber-500' : 'text-emerald-500'}">\${perT}</span>\` : ''}
                           </div>
-                          <div class="bg-slate-50 dark:bg-slate-800/50 rounded-xl p-2.5">
-                              <div class="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">\${dailyLabel}</div>
-                              <div class="text-sm font-black text-slate-800 dark:text-white">\${userDReqs} <span class="text-[10px] font-semibold text-slate-400">\${rLabel}</span></div>
-                              \${u.limitDailyReq ? \`
-                              <div class="w-full bg-slate-200 dark:bg-slate-700 h-1.5 rounded-full overflow-hidden mt-1.5">
-                                  <div class="bg-gradient-to-r \${parseFloat(perD) > 85 ? 'from-red-500 to-rose-600' : parseFloat(perD) > 60 ? 'from-amber-500 to-orange-500' : 'from-emerald-500 to-teal-500'} h-full rounded-full" style="width: \${perD}"></div>
-                              </div>
-                              <div class="flex items-center justify-between mt-1">
-                                  <span class="text-[9px] text-slate-400">/ \${(u.limitDailyReq/6000).toFixed(2)} GB</span>
-                                  \${perD !== '-' ? \`<span class="text-[9px] font-bold \${parseFloat(perD) > 85 ? 'text-red-500' : parseFloat(perD) > 60 ? 'text-amber-500' : 'text-emerald-500'}">\${perD}</span>\` : ''}
-                              </div>
-                              \` : '<div class="text-[9px] text-slate-400 mt-1">' + unlimitedTxt + '</div>'}
+                          \${u.limitTotalReq ? \`
+                          <div class="w-full bg-slate-100 dark:bg-slate-800 h-1.5 rounded-full overflow-hidden">
+                              <div class="bg-gradient-to-r \${parseFloat(perT) > 85 ? 'from-red-500 to-rose-600' : parseFloat(perT) > 60 ? 'from-amber-500 to-orange-500' : 'from-emerald-500 to-teal-500'} h-full rounded-full" style="width: \${perT}"></div>
                           </div>
-                      </div>
-                      <div class="flex items-center justify-between mt-2 pt-2 border-t border-slate-100 dark:border-slate-800">
-                          <span class="text-[10px] text-slate-400">📅 \${expTxt}</span>
+                          \` : ''}
+                          <div class="flex items-center justify-between text-[10px] text-slate-400">
+                              <span>\${dailyLabel} \${userDReqs} \${rLabel}</span>
+                              <span>\${expTxt}</span>
+                          </div>
                       </div>
                   \`;
                   tblHtml += '</div>';
@@ -8339,41 +7908,13 @@ function getDashboardUI(hasDB) {
               return (window.nahanConfig && window.nahanConfig.mode) ? window.nahanConfig.mode : 'alpha';
           }
 
-          function openAddUserPage() {
-              document.getElementById('view-users').classList.add('hidden');
-              document.getElementById('view-add-user').classList.remove('hidden');
-              var sc = document.querySelector('.scroll-content');
-              sc.style.overflow = 'hidden';
-              sc.classList.add('flex', 'flex-col');
-              sc.firstElementChild.classList.add('flex-1', 'min-h-0', 'flex', 'flex-col');
-              updateTitleText('Add User');
+          function openAddUserModal() {
+              document.getElementById('modal-add-user').classList.remove('hidden');
               buildPortCheckboxes('add-user-ports-wrap', null);
               buildModeCheckboxes('add-user-mode-wrap', null);
               buildIPCheckboxes("add-user-clean-ips-wrap", "", (window.nahanConfig?.cleanIps||"").split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
               buildIPCheckboxes("add-user-proxy-ips-wrap", "", (window.nahanConfig?.backupRelay||"").split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
               buildNodeCheckboxes("add-user-nodes-wrap", "", (window.nahanConfig?.slaveNodes||"").split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
-          }
-          function closeAddUserPage() {
-              document.getElementById('view-add-user').classList.add('hidden');
-              document.getElementById('view-users').classList.remove('hidden');
-              var sc = document.querySelector('.scroll-content');
-              sc.style.overflow = '';
-              sc.classList.remove('flex', 'flex-col');
-              sc.firstElementChild.classList.remove('flex-1', 'min-h-0', 'flex', 'flex-col');
-              updateTitle();
-          }
-          function closeEditUserPage() {
-              document.getElementById('view-edit-user').classList.add('hidden');
-              document.getElementById('view-users').classList.remove('hidden');
-              var sc = document.querySelector('.scroll-content');
-              sc.style.overflow = '';
-              sc.classList.remove('flex', 'flex-col');
-              sc.firstElementChild.classList.remove('flex-1', 'min-h-0', 'flex', 'flex-col');
-              updateTitle();
-          }
-          function updateTitleText(txt) {
-              var el = document.getElementById('view-title');
-              if (el) el.innerText = txt;
           }
 
           
@@ -8520,43 +8061,32 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
                   return;
               }
 
-               tReq = tReq ? parseInt(tReq) : null;
-               dReq = dReq ? parseInt(dReq) : null;
-               days = days ? parseInt(days) : null;
-               let connLimit = document.getElementById('add-user-conn-limit').value;
-               connLimit = connLimit ? parseInt(connLimit) : null;
-               const userPanelUrl = document.getElementById('add-user-panel-url').value.trim() || null;
-               
-               let newId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
-                   .map((b,i) => (i===4||i===6||i===8||i===10?'-':'') + b.toString(16).padStart(2,'0')).join('');
-               
-                const u = {
-                    id: newId,
-                    name: name,
-                    limitTotalReq: tReq,
-                    limitDailyReq: dReq,
-                    expiryMs: days ? Date.now() + days*86400000 : null,
-                    proxyIp: proxyIp,
-                     cleanIp: cleanIp,
-                     customName: customName,
-                     userMode: userMode,
-                     userPorts: userPorts,
-                     maxConfigs: maxConfigs,
-                     userNodes: userNodes,
-                     nat64: nat64,
-                     connLimit: connLimit,
-                     userPanelUrl: userPanelUrl,
-                     createdAt: Date.now()
-                };
+              tReq = tReq ? parseInt(tReq) : null;
+              dReq = dReq ? parseInt(dReq) : null;
+              days = days ? parseInt(days) : null;
+              
+              let newId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+                  .map((b,i) => (i===4||i===6||i===8||i===10?'-':'') + b.toString(16).padStart(2,'0')).join('');
+              
+               const u = {
+                   id: newId,
+                   name: name,
+                   limitTotalReq: tReq,
+                   limitDailyReq: dReq,
+                   expiryMs: days ? Date.now() + days*86400000 : null,
+                   proxyIp: proxyIp,
+                    cleanIp: cleanIp,
+                    customName: customName,
+                    userMode: userMode,
+                    userPorts: userPorts,
+                    maxConfigs: maxConfigs,
+                    userNodes: userNodes,
+                    nat64: nat64,
+                    createdAt: Date.now()
+               };
               
               window.nahanConfig.users.push(u);
-              document.getElementById('view-add-user').classList.add('hidden');
-              document.getElementById('view-users').classList.remove('hidden');
-              var sc = document.querySelector('.scroll-content');
-              sc.style.overflow = '';
-              sc.classList.remove('flex', 'flex-col');
-              sc.firstElementChild.classList.remove('flex-1', 'min-h-0', 'flex', 'flex-col');
-              updateTitle();
+              document.getElementById('modal-add-user').classList.add('hidden');
               document.getElementById('add-user-name').value = '';
                document.getElementById('add-user-custom-name').value = '';
                document.getElementById('add-user-custom-clean').value = '';
@@ -8566,8 +8096,6 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
               document.getElementById('add-user-daily-reqs').value = '';
               document.getElementById('add-user-days').value = '';
               document.getElementById('add-user-max-configs').value = '';
-              document.getElementById('add-user-conn-limit').value = '';
-              document.getElementById('add-user-panel-url').value = '';
               
               renderUsersTable();
               doSaveDirectly();
@@ -8624,8 +8152,6 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
                document.getElementById('edit-user-custom-name').value = u.customName || '';
               
               document.getElementById('edit-user-max-configs').value = u.maxConfigs || '';
-              document.getElementById('edit-user-conn-limit').value = u.connLimit || '';
-              document.getElementById('edit-user-panel-url').value = u.userPanelUrl || '';
               
               buildPortCheckboxes('edit-user-ports-wrap', u.userPorts);
               buildModeCheckboxes('edit-user-mode-wrap', u.userMode);
@@ -8637,13 +8163,7 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
               }
               document.getElementById('edit-user-days').value = daysLeft;
               
-              document.getElementById('view-users').classList.add('hidden');
-              document.getElementById('view-edit-user').classList.remove('hidden');
-              var sc = document.querySelector('.scroll-content');
-              sc.style.overflow = 'hidden';
-              sc.classList.add('flex', 'flex-col');
-              sc.firstElementChild.classList.add('flex-1', 'min-h-0', 'flex', 'flex-col');
-              updateTitleText('Edit Subscriber');
+              document.getElementById('modal-edit-user').classList.remove('hidden');
           }
 
           function commitEditUser() {
@@ -8682,10 +8202,7 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
                if (nodesCheckbox) nodesArray.push(...nodesCheckbox.split(','));
                if (nodesCustom) nodesArray.push(...nodesCustom.split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
                const userNodes = nodesArray.length ? nodesArray.join(',') : null;
-                const nat64 = document.getElementById('add-user-nat64').value.trim() || null;
-                let connLimit = document.getElementById('edit-user-conn-limit').value;
-                connLimit = connLimit ? parseInt(connLimit) : null;
-                const userPanelUrl = document.getElementById('edit-user-panel-url').value.trim() || null;
+               const nat64 = document.getElementById('add-user-nat64').value.trim() || null;
                
                if(!name) {
                   alert(lang === 'fa' ? 'لطفاً نام را وارد کنید' : 'Please enter a name');
@@ -8717,89 +8234,10 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
               u.maxConfigs = maxConfigs;
               u.userNodes = userNodes;
               u.nat64 = nat64;
-              u.connLimit = connLimit;
-              u.userPanelUrl = userPanelUrl;
               
-              document.getElementById('view-edit-user').classList.add('hidden');
-              document.getElementById('view-users').classList.remove('hidden');
-              var sc = document.querySelector('.scroll-content');
-              sc.style.overflow = '';
-              sc.classList.remove('flex', 'flex-col');
-              sc.firstElementChild.classList.remove('flex-1', 'min-h-0', 'flex', 'flex-col');
+              document.getElementById('modal-edit-user').classList.add('hidden');
               renderUsersTable();
               doSaveDirectly();
-          }
-
-          async function loadApiKeys() {
-              try {
-                  const res = await fetch(baseRoute + '/api/keys', {
-                      headers: { 'Authorization': 'Bearer ' + sessionKey }
-                  });
-                  const data = await res.json();
-                  if (data.success) {
-                      const list = document.getElementById('api-keys-list');
-                      if (!list) return;
-                      if (!data.keys || data.keys.length === 0) {
-                          list.innerHTML = '<p class="text-xs text-slate-400 dark:text-slate-500">' + (i18n[lang]?.api_keys_empty || 'No API keys generated yet.') + '</p>';
-                          return;
-                      }
-                      list.innerHTML = data.keys.map(k => {
-                          const created = new Date(k.createdAt).toLocaleDateString();
-                          const lastUsed = k.lastUsed ? new Date(k.lastUsed).toLocaleDateString() : (i18n[lang]?.never || 'Never');
-                          return '<div class="flex items-center justify-between p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-darkborder">' +
-                              '<div class="flex-1 min-w-0">' +
-                              '<p class="text-xs font-bold text-slate-700 dark:text-slate-200 truncate">' + (k.name || 'Unnamed') + '</p>' +
-                              '<p class="text-[10px] font-mono text-slate-400 mt-0.5">' + k.keyPreview + '</p>' +
-                              '<p class="text-[10px] text-slate-400 mt-0.5">' + (i18n[lang]?.created || 'Created') + ': ' + created + ' · ' + (i18n[lang]?.last_used || 'Last used') + ': ' + lastUsed + '</p>' +
-                              '</div>' +
-                              '<button onclick="revokeApiKey(\\'' + k.id + '\\')" class="ms-3 px-3 py-1.5 bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 text-[10px] font-bold rounded-lg border border-red-200 dark:border-red-800 hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors">' + (i18n[lang]?.revoke || 'Revoke') + '</button>' +
-                              '</div>';
-                      }).join('');
-                  }
-              } catch(e) {}
-          }
-
-          async function generateApiKey() {
-              const name = prompt(i18n[lang]?.enter_key_name || 'Enter a name for this API key:');
-              if (!name) return;
-              try {
-                  const res = await fetch(baseRoute + '/api/keys', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + sessionKey },
-                      body: JSON.stringify({ action: 'create', name })
-                  });
-                  const data = await res.json();
-                  if (data.success && data.key) {
-                      const newBox = document.getElementById('api-key-new');
-                      const keyInput = document.getElementById('api-key-value');
-                      keyInput.value = data.key.key;
-                      newBox.classList.remove('hidden');
-                      loadApiKeys();
-                  } else {
-                      alert(data.error || 'Failed to create key');
-                  }
-              } catch(e) { alert('Error: ' + e.message); }
-          }
-
-          async function revokeApiKey(id) {
-              if (!confirm(i18n[lang]?.confirm_revoke || 'Revoke this API key? The remote panel will lose access.')) return;
-              try {
-                  const res = await fetch(baseRoute + '/api/keys', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + sessionKey },
-                      body: JSON.stringify({ action: 'revoke', id })
-                  });
-                  const data = await res.json();
-                  if (data.success) loadApiKeys();
-                  else alert(data.error || 'Failed to revoke key');
-              } catch(e) { alert('Error: ' + e.message); }
-          }
-
-          function copyApiKey() {
-              const input = document.getElementById('api-key-value');
-              navigator.clipboard.writeText(input.value);
-              const stat = document.getElementById('save-status');
-              if (stat) { stat.textContent = "Copied!"; stat.className = "text-sm font-bold text-emerald-500 md:me-4"; setTimeout(() => { stat.textContent = ""; }, 2000); }
           }
 
           async function doSaveDirectly() {
