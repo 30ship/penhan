@@ -974,10 +974,13 @@ proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-20
                               <div data-accordion-content="" class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
                                   <div class="space-y-4 px-5 pb-5 pt-1">
                                       <div class="space-y-1">
-                                          <label class="block text-sm font-bold text-slate-600 dark:text-slate-300">Custom Direct Routing (Domains / IPs)</label>
-                                          <textarea id="cfg-custom-routing" rows="3" placeholder="example.com
-1.2.3.4" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
-                                          <p class="text-xs text-slate-400 mt-1">One domain or IP per line to route to DIRECT. Example: mydomain.com</p>
+                                          <label class="block text-sm font-bold text-slate-600 dark:text-slate-300">Custom Direct Routing (Domains / IPs / GeoIP / GeoSite)</label>
+                                          <textarea id="cfg-custom-routing" rows="4" placeholder="example.com&#10;1.2.3.4&#10;geoip:ir&#10;geosite:ir" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
+                                          <p class="text-xs text-slate-400 mt-1">One domain, IP, geoip (e.g., geoip:ir) or geosite (e.g., geosite:ir) per line to route to DIRECT.</p>
+                                           <div class="mt-2 p-3 rounded-xl bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-900/30 text-xs text-amber-700 dark:text-amber-300 leading-relaxed font-sans flex gap-2">
+                                               <span>⚠️</span>
+                                               <span><strong>Important Note:</strong> Any incorrect entry, typo, or misformatted routing rule in this section can cause connection failures or subscription import problems. Please double check all syntax before saving.</span>
+                                           </div>
                                       </div>
                                   </div>
                               </div>
@@ -3060,6 +3063,7 @@ proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-20
 
                       window.nahanConfig = JSON.parse(JSON.stringify(conf));
                       window.nahanUsage = data.sysUsage || {};
+                      window.nahanLiveUsage = data.usage || {};
                       window.nahanProfiles = data.profiles || [];
                       renderUsersTable();
                       renderLinkedNodes();
