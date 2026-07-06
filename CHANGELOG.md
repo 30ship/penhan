@@ -7,6 +7,43 @@
 All notable changes to Project Nahan will be documented in this file.
 <!-- LANG:EN -->
 
+
+## [2.9.4] - 2026-07-06
+
+<!-- LANG:FA -->
+### اضافه شده (Added)
+- **محدودیت کانفیگ (maxConfigs)**: افزودن قابلیت maxConfigs برای محدود کردن تعداد کانفیگ‌های تولید شده هر کاربر.
+- **ردیابی اتصالات زنده**: تعداد لحظه‌ای اتصالات استریم زنده در داشبورد برای هر کاربر/پروفایل اضافه شد.
+- **کرون‌جاب آپدیت خودکار**: افزودن قابلیت برنامه‌ریزی کرون‌جاب (cron) برای بروزرسانی خودکار ورکر Cloudflare.
+- **پشتیبانی از v2rayN JSON**: پشتیبانی از پارامتر `?format=vjson` برای خروجی پیکربندی‌های خام V2Ray/v2rayN JSON.
+- **دریافت داینامیک رابط کاربری**: فایل‌های HTML داشبورد و صفحه اشتراک اکنون به صورت داینامیک دریافت می‌شوند که حجم ورکر را به شدت کاهش می‌دهد.
+
+### رفع شده (Fixed)
+- **منطق محدودیت اتصالات**: رفع مشکل منطق محدودیت `activeConnections` و کاهش صحیح آن هنگام بسته شدن وب‌ساکت.
+- **امنیت احراز هویت**: حذف جستجوی کلید احراز هویت از پارامتر URL برای جلوگیری از ثبت در لاگ‌های سرور.
+
+### بهبود یافته (Improved)
+- **بروزرسانی خودکار داشبورد**: اضافه شدن تازه‌سازی خودکار آمار داشبورد با استفاده از کرون زمان‌بندی داخلی.
+- **مدیریت حافظه**: افزودن محدودیت مدیریت حافظه که `configRegistry` را پس از ۱۰ هزار ورود پاک می‌کند تا از خطاهای حافظه جلوگیری شود.
+<!-- LANG:FA -->
+
+<!-- LANG:EN -->
+### Added
+- **maxConfigs per user**: Added maxConfigs option per user to limit the number of generated configurations.
+- **Live active connections**: Live active connections stream count in the dashboard for each user/profile.
+- **Auto-Update Cron**: Added scheduled cron job capability for automatic Cloudflare worker updates.
+- **v2rayN JSON output**: Added `?format=vjson` parameter support for raw V2Ray/v2rayN JSON configuration outputs.
+- **Dynamic UI Fetching**: Dashboard HTML & Subscription Info HTML are now dynamically fetched, drastically reducing worker payload size.
+
+### Fixed
+- **Connection limit tracking**: Fixed activeConnections tracking limit logic and decrements upon WebSocket close.
+- **Security enhancement**: Removed url authentication key fallback to prevent potential API key logging in server access logs.
+
+### Improved
+- **Dashboard auto-refresh**: Added auto-refreshing dashboard stats using setInterval on dashboard intervals.
+- **Memory management**: Added memory management limit that clears configRegistry if it exceeds 10,000 entries.
+<!-- LANG:EN -->
+
 ---
 
 ## [2.9.1] - ۱۴۰۵-۰۴-۰۴ (2026-06-26)
